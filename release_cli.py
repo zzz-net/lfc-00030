@@ -72,6 +72,8 @@ def _new_state(version, batch_id):
         "migration_reminders": [],
         "known_issues": [],
         "approved": False,
+        "approved_at_version": None,
+        "approved_at_draft_version": None,
         "audit_log": [],
         "current_batch_id": batch_id,
     }
@@ -169,7 +171,7 @@ def cmd_import(args, rules):
         print(f"[ERROR] manifest not found: {manifest_path}")
         sys.exit(1)
 
-    with open(manifest_path, "r", encoding="utf-8") as f:
+    with open(manifest_path, "r", encoding="utf-8-sig") as f:
         manifest = json.load(f)
 
     batch_id = manifest.get("batch_id", "")
@@ -177,6 +179,15 @@ def cmd_import(args, rules):
 
     if state is None:
         state = _new_state(version, batch_id)
+
+    if state.get("approved"):
+        print(
+            f"[REJECTED] Current version {state.get('version')} is already approved. "
+            "Roll back or reset state before importing a new batch. Original draft preserved."
+        )
+        _audit(state, "import_rejected", f"approved state blocks new import: batch={batch_id}")
+        save_state(state, state_path)
+        sys.exit(1)
 
     if batch_id and batch_id in state.get("imported_batches", []):
         print(f"[REJECTED] batch '{batch_id}' already imported, duplicate import blocked. Original draft preserved.")
@@ -212,6 +223,11 @@ def cmd_import(args, rules):
         print("[WARNING] Validation issues detected:")
         for w in warnings:
             print(w)
+
+    if version != state.get("version") and state.get("version") is not None:
+        state["approved"] = False
+        state["approved_at_version"] = None
+        state["approved_at_draft_version"] = None
 
     state["version"] = version
     state["items"].extend(new_items)
@@ -382,6 +398,8 @@ def cmd_approve(args, rules):
         sys.exit(1)
 
     state["approved"] = True
+    state["approved_at_version"] = state.get("version")
+    state["approved_at_draft_version"] = state.get("draft_version")
     _audit(state, "approved", f"version={state.get('version')}, draft_v{state.get('draft_version')}")
     save_state(state, state_path)
     print(f"[OK] Version {state.get('version')} approved!")
@@ -394,9 +412,41 @@ def cmd_rollback(args, rules):
         print("[ERROR] No state found.")
         sys.exit(1)
 
-    if state["approved"]:
-        print("[ERROR] Version already approved, rollback not allowed.")
-        sys.exit(1)
+    was_approved = state.get("approved", False)
+
+    if was_approved:
+        state["approved"] = False
+        prev_ver = state.get("approved_at_version")
+        prev_dv = state.get("approved_at_draft_version")
+        state["approved_at_version"] = None
+        state["approved_at_draft_version"] = None
+        _audit(state, "unapprove", f"approval cleared for version={prev_ver} draft_v{prev_dv}")
+
+        if len(state.get("drafts", [])) < 1:
+            save_state(state, state_path)
+            print(f"[OK] Approval rolled back (was version {prev_ver} draft_v{prev_dv}). No draft snapshots to revert.")
+            return
+
+        target = state["drafts"][-1]
+        state["items"] = copy.deepcopy(target["items_snapshot"])
+        state["migration_reminders"] = copy.deepcopy(target["migration_reminders_snapshot"])
+        state["known_issues"] = copy.deepcopy(target["known_issues_snapshot"])
+        state["confirmations"] = copy.deepcopy(target["confirmations_snapshot"])
+        state["migration_processed"] = copy.deepcopy(target["migration_processed_snapshot"])
+        state["known_issues_reviewed"] = target["known_issues_reviewed_snapshot"]
+        state["draft_version"] = target["version"]
+
+        _audit(
+            state,
+            "rollback",
+            f"after unapprove: restored approved snapshot draft v{target['version']} (was approved at draft_v{prev_dv})"
+        )
+        save_state(state, state_path)
+        print(
+            f"[OK] Approval cleared and state restored to the approved snapshot "
+            f"(draft v{target['version']}, version {state.get('version')})."
+        )
+        return
 
     if len(state.get("drafts", [])) < 2:
         print("[ERROR] No previous draft to rollback to (need at least 2 drafts).")
@@ -431,12 +481,31 @@ def cmd_export(args, rules):
         print("[ERROR] Version not approved yet. Run 'approve' first.")
         sys.exit(1)
 
+    if (
+        state.get("approved_at_version") != state.get("version")
+        or state.get("approved_at_draft_version") != state.get("draft_version")
+    ):
+        print(
+            "[REJECTED] State has drifted since approval "
+            f"(approved v{state.get('approved_at_version')}/draft{state.get('approved_at_draft_version')} "
+            f"!= current v{state.get('version')}/draft{state.get('draft_version')}). "
+            "Run 'approve' again after resolving drift."
+        )
+        _audit(
+            state,
+            "export_rejected",
+            f"drift detected: approved v{state.get('approved_at_version')}/d{state.get('approved_at_draft_version')} "
+            f"vs current v{state.get('version')}/d{state.get('draft_version')}"
+        )
+        save_state(state, state_path)
+        sys.exit(1)
+
     md = _render_markdown(state)
     out_path = args.output or os.path.join(SCRIPT_DIR, f"release_notes_v{state['version']}_final.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(md)
 
-    _audit(state, "export", f"version={state['version']} -> {out_path}")
+    _audit(state, "export", f"version={state['version']} draft_v{state.get('draft_version')} -> {out_path}")
     save_state(state, state_path)
     print(f"[OK] Final release notes exported -> {out_path}")
 
@@ -451,6 +520,8 @@ def cmd_status(args, rules):
     print(f"Version:       {state.get('version', '?')}")
     print(f"Draft:         v{state.get('draft_version', 0)}")
     print(f"Approved:      {state.get('approved', False)}")
+    if state.get("approved"):
+        print(f"Approved at:   v{state.get('approved_at_version')} / draft v{state.get('approved_at_draft_version')}")
     print(f"Items:         {len(state.get('items', []))}")
     print(f"Batches:       {state.get('imported_batches', [])}")
     print()
