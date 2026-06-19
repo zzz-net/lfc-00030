@@ -1092,8 +1092,8 @@ def test_24_package_validation(tmpdir):
 
 
 def test_25_import_reject_target_newer(tmpdir):
-    """import_package: 目标状态比包新时默认拒绝，--force 可绕过"""
-    print("\n== Test 25: import_package reject target newer ==")
+    """import_package: 目标状态比包新时默认标记BLOCKED，--force + takeover_confirm 可绕过"""
+    print("\n== Test 25: import_package target newer -> reconcile BLOCKED -> force confirm ==")
     sp_old = os.path.join(tmpdir, "state_t25_old.json")
     sp_new = os.path.join(tmpdir, "state_t25_new.json")
     cleanup_patterns(tmpdir, "state_t25_old.json")
@@ -1113,31 +1113,45 @@ def test_25_import_reject_target_newer(tmpdir):
     s_new = read_state(sp_new)
     assert_eq(s_new["draft_version"], 2, "t25 setup: target draft_v=2 (newer than package)")
 
-    res = run_cli(["import_package", pkg, "--operator", "test25-importer"], sp_new, expect_fail=True)
-    assert_in("Target state is NEWER", res.stdout, "t25 rejected: target is newer")
+    res = run_cli(["import_package", pkg, "--operator", "test25-importer", "--mode", "takeover"], sp_new)
+    assert_in("Target state is NEWER", res.stdout, "t25 reconcile: target is newer flagged")
+    assert_in("BLOCKED", res.stdout, "t25 reconcile: BLOCKED tag present")
+    assert_in("RECONCILED - BUT BLOCKED", res.stdout, "t25 reconcile: status is BLOCKED (not AWAITING)")
 
     s_after = read_state(sp_new)
     actions = [e["action"] for e in s_after["audit_log"]]
-    assert_in("import_package_rejected", actions, "t25 audit has import_package_rejected")
+    assert_in("import_package_reconciled", actions, "t25 audit has import_package_reconciled (not rejected)")
+    assert s_after.get("pending_takeover") is not None, "t25 pending_takeover created"
+    assert len(s_after.get("takeover_history", [])) == 0, "t25 no takeover_history yet (not confirmed)"
 
     res_force = run_cli(["import_package", pkg, "--operator", "test25-importer",
                          "--mode", "takeover", "--force"], sp_new)
-    assert_in("[OK] Package imported", res_force.stdout, "t25 --force allows override")
+    assert_in("AWAITING CONFIRMATION", res_force.stdout, "t25 --force reconcile still pending (two-step)")
+
+    s_before_confirm = read_state(sp_new)
+    assert s_before_confirm.get("pending_takeover") is not None, "t25 pending_takeover still present"
+
+    res_confirm = run_cli(["takeover_confirm", "--operator", "test25-importer", "--force"], sp_new)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t25 --force confirm succeeds")
 
     s_forced = read_state(sp_new)
     assert_eq(s_forced["draft_version"], 1, "t25 force takeover: draft_v reset to package v=1")
     assert_eq(s_forced["items"][2]["owner"], "", "t25 force takeover: CHG-003 owner reset to package state (empty)")
+    assert s_forced.get("pending_takeover") is None, "t25 pending_takeover cleared after confirm"
 
-    takeover_events = [e for e in s_forced["audit_log"] if e["action"] == "import_package_takeover"]
-    assert_eq(len(takeover_events), 1, "t25 audit has import_package_takeover event")
+    takeover_events = [e for e in s_forced["audit_log"] if e["action"] == "takeover_confirmed"]
+    assert_eq(len(takeover_events), 1, "t25 audit has takeover_confirmed event")
     assert_in("force=True", takeover_events[0]["detail"], "t25 takeover audit records force=True")
+
+    assert len(s_forced.get("takeover_history", [])) == 1, "t25 takeover_history has 1 entry after confirm"
+    assert len(s_forced.get("confirmed_takeover_sessions", {})) == 1, "t25 confirmed session created"
     cleanup_patterns(tmpdir, "state_t25_old.json")
     cleanup_patterns(tmpdir, "state_t25_new.json")
 
 
 def test_26_import_mode_takeover(tmpdir):
-    """import_package: mode=takeover 完全替换目标状态"""
-    print("\n== Test 26: import_package mode=takeover ==")
+    """import_package+takeover_confirm: mode=takeover 完全替换目标状态（两步流程）"""
+    print("\n== Test 26: import_package reconcile -> takeover_confirm (mode=takeover) ==")
     sp_source = os.path.join(tmpdir, "state_t26_source.json")
     sp_target = os.path.join(tmpdir, "state_t26_target.json")
     cleanup_patterns(tmpdir, "state_t26_source.json")
@@ -1153,6 +1167,16 @@ def test_26_import_mode_takeover(tmpdir):
     pkg = os.path.join(tmpdir, "pkg_t26.json")
     run_cli(["export_package", "-o", pkg, "--operator", "源机负责人"], sp_source)
 
+    with open(pkg, "r", encoding="utf-8") as f:
+        pkg_data = json.load(f)
+    assert "handover_summary" in pkg_data, "t26 package has handover_summary"
+    hs26 = pkg_data["handover_summary"]
+    assert_eq(len(hs26["sections_confirmed"]), 4, "t26 handover_summary: 4 sections confirmed")
+    assert "overview" in hs26["sections_confirmed"], "t26 overview confirmed"
+    assert "changes" in hs26["sections_confirmed"], "t26 changes confirmed"
+    assert "migration" in hs26["sections_confirmed"], "t26 migration confirmed"
+    assert "known_issues" in hs26["sections_confirmed"], "t26 known_issues confirmed"
+
     run_cli(["import", SAMPLE], sp_target)
     run_cli(["draft"], sp_target)
     run_cli(["amend", "CHG-001", "--field", "owner=目标本地修改"], sp_target)
@@ -1161,10 +1185,22 @@ def test_26_import_mode_takeover(tmpdir):
     chg001_before = next(it for it in s_target_before["items"] if it["id"] == "CHG-001")
     assert_eq(chg001_before["owner"], "目标本地修改", "t26 setup: target has local change to CHG-001")
 
-    res = run_cli(["import_package", pkg, "--operator", "接管人B", "--mode", "takeover"], sp_target)
-    assert_in("[OK] Package imported successfully (mode=takeover)", res.stdout, "t26 takeover import succeeds")
+    res_reconcile = run_cli(["import_package", pkg, "--operator", "接管人B", "--mode", "takeover"], sp_target)
+    assert_in("RECONCILED", res_reconcile.stdout, "t26 reconcile step shows RECONCILED")
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t26 reconcile: AWAITING CONFIRMATION")
+    assert_in("Handover Summary from Source", res_reconcile.stdout, "t26 reconcile shows handover summary")
+
+    s_pending = read_state(sp_target)
+    assert s_pending.get("pending_takeover") is not None, "t26 pending_takeover created"
+    assert_eq(len(s_pending.get("takeover_history", [])), 0, "t26 no takeover_history yet before confirm")
+
+    res_confirm = run_cli(["takeover_confirm", "--operator", "接管人B"], sp_target)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t26 confirm succeeds")
 
     s_target_after = read_state(sp_target)
+    assert s_target_after.get("pending_takeover") is None, "t26 pending_takeover cleared after confirm"
+    assert_eq(len(s_target_after.get("takeover_history", [])), 1, "t26 takeover_history has 1 entry")
+
     chg001_after = next(it for it in s_target_after["items"] if it["id"] == "CHG-001")
     assert_eq(chg001_after["owner"], "张三", "t26 takeover: CHG-001 reverted to package state (张三)")
 
@@ -1174,17 +1210,23 @@ def test_26_import_mode_takeover(tmpdir):
     assert_eq(s_target_after["confirmations"]["overview"], True, "t26 takeover: confirmations from package preserved")
     assert_eq(s_target_after["confirmations"]["changes"], True, "t26 takeover: changes confirmed")
 
-    takeover_events = [e for e in s_target_after["audit_log"] if e["action"] == "import_package_takeover"]
-    assert_eq(len(takeover_events), 1, "t26 audit has import_package_takeover")
+    takeover_events = [e for e in s_target_after["audit_log"] if e["action"] == "takeover_confirmed"]
+    assert_eq(len(takeover_events), 1, "t26 audit has takeover_confirmed")
     assert_in("接管人B", takeover_events[0]["detail"], "t26 takeover audit records operator=接管人B")
-    assert_in("源机负责人", takeover_events[0]["detail"], "t26 takeover audit records exported_by=源机负责人")
+    assert_eq(s_target_after["takeover_history"][0].get("exported_by"), "源机负责人", "t26 takeover_history exported_by=源机负责人")
+
+    sessions = s_target_after.get("confirmed_takeover_sessions", {})
+    assert_eq(len(sessions), 1, "t26 confirmed session created")
+    session_key = list(sessions.keys())[0]
+    assert sessions[session_key]["revoked"] == False, "t26 session not revoked"
+    assert sessions[session_key]["confirmed_by"] == "接管人B", "t26 session confirmed_by correct"
     cleanup_patterns(tmpdir, "state_t26_source.json")
     cleanup_patterns(tmpdir, "state_t26_target.json")
 
 
 def test_27_import_mode_merge(tmpdir):
-    """import_package: mode=merge 保留目标历史，包状态作为新起点"""
-    print("\n== Test 27: import_package mode=merge ==")
+    """import_package+takeover_confirm: mode=merge 保留目标历史，包状态作为新起点（两步流程）"""
+    print("\n== Test 27: import_package reconcile -> takeover_confirm (mode=merge) ==")
     sp_source = os.path.join(tmpdir, "state_t27_source.json")
     sp_target = os.path.join(tmpdir, "state_t27_target.json")
     cleanup_patterns(tmpdir, "state_t27_source.json")
@@ -1211,14 +1253,21 @@ def test_27_import_mode_merge(tmpdir):
     target_audit_len = len(s_target_before["audit_log"])
     assert_eq(s_target_before["draft_version"], 1, "t27 setup: target state draft_v=1 (older than package)")
 
-    res = run_cli(["import_package", pkg, "--operator", "合并者C", "--mode", "merge",
-                   "--keep-target-batches"], sp_target)
-    assert_in("[OK] Package imported successfully (mode=merge)", res.stdout, "t27 merge import succeeds")
+    res_reconcile = run_cli(["import_package", pkg, "--operator", "合并者C", "--mode", "merge",
+                             "--keep-target-batches"], sp_target)
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t27 merge reconcile: AWAITING CONFIRMATION")
+
+    s_pending = read_state(sp_target)
+    assert s_pending.get("pending_takeover") is not None, "t27 pending_takeover created"
+
+    res_confirm = run_cli(["takeover_confirm", "--operator", "合并者C"], sp_target)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t27 merge confirm succeeds")
 
     s_target_after = read_state(sp_target)
+    assert s_target_after.get("pending_takeover") is None, "t27 pending_takeover cleared after confirm"
 
-    merge_events = [e for e in s_target_after["audit_log"] if e["action"] == "import_package_merge"]
-    assert len(merge_events) >= 1, "t27 audit has import_package_merge event(s)"
+    merge_events = [e for e in s_target_after["audit_log"] if e["action"] == "takeover_confirmed"]
+    assert len(merge_events) >= 1, "t27 audit has takeover_confirmed event"
 
     chg003_after = next(it for it in s_target_after["items"] if it["id"] == "CHG-003")
     assert_eq(chg003_after["owner"], "周七", "t27 merge: CHG-003 has package value 周七")
@@ -1230,17 +1279,21 @@ def test_27_import_mode_merge(tmpdir):
     assert total_audit >= expected_min, f"t27 merge: audit log merged (target={target_audit_len} + merge marker + source={source_audit_len} <= total={total_audit})"
 
     actions = [e["action"] for e in s_target_after["audit_log"]]
-    assert_in("import_package_merge", actions, "t27 merge event in audit")
+    assert_in("takeover_confirmed", actions, "t27 takeover_confirmed event in audit")
 
     batches = s_target_after["imported_batches"]
     assert_eq(len(batches), 1, "t27 merge: only 1 unique batch (batch-2026Q2-v2.1.0)")
+
+    assert_eq(len(s_target_after.get("takeover_history", [])), 1, "t27 takeover_history has 1 entry")
+    takeover = s_target_after["takeover_history"][0]
+    assert_eq(takeover["mode"], "merge", "t27 takeover mode is merge")
     cleanup_patterns(tmpdir, "state_t27_source.json")
     cleanup_patterns(tmpdir, "state_t27_target.json")
 
 
 def test_28_import_reject_approved_target(tmpdir):
-    """import_package: 目标已批准时默认拒绝，--force 可绕过"""
-    print("\n== Test 28: import_package reject approved target ==")
+    """import_package: 目标已批准时标记BLOCKED，--force + takeover_confirm 可绕过"""
+    print("\n== Test 28: import_package approved target BLOCKED -> force confirm ==")
     sp_source = os.path.join(tmpdir, "state_t28_source.json")
     sp_target = os.path.join(tmpdir, "state_t28_target.json")
     cleanup_patterns(tmpdir, "state_t28_source.json")
@@ -1269,20 +1322,28 @@ def test_28_import_reject_approved_target(tmpdir):
     assert_eq(s_target["approved"], True, "t28 setup: target is approved")
     assert_eq(s_target["draft_version"], 2, "t28 setup: target draft_v=2 (older than package)")
 
-    res = run_cli(["import_package", pkg, "--operator", "test28-importer"], sp_target, expect_fail=True)
-    assert_in("already approved", res.stdout, "t28 rejected: target already approved")
+    res = run_cli(["import_package", pkg, "--operator", "test28-importer", "--mode", "takeover"], sp_target)
+    assert_in("already approved", res.stdout, "t28 reconcile: target already approved flagged")
+    assert_in("BLOCKED", res.stdout, "t28 reconcile: BLOCKED tag present")
+    assert_in("RECONCILED - BUT BLOCKED", res.stdout, "t28 reconcile: status is BLOCKED (not AWAITING)")
 
-    s_after_reject = read_state(sp_target)
-    actions = [e["action"] for e in s_after_reject["audit_log"]]
-    assert_in("import_package_rejected", actions, "t28 audit has import_package_rejected")
+    s_after_reconcile = read_state(sp_target)
+    actions = [e["action"] for e in s_after_reconcile["audit_log"]]
+    assert_in("import_package_reconciled", actions, "t28 audit has import_package_reconciled (not rejected)")
+    assert s_after_reconcile.get("pending_takeover") is not None, "t28 pending_takeover created"
 
-    res_force = run_cli(["import_package", pkg, "--operator", "test28-importer",
-                         "--mode", "takeover", "--force"], sp_target)
-    assert_in("[OK] Package imported", res_force.stdout, "t28 --force allows override of approved state")
+    res_confirm_no_force = run_cli(["takeover_confirm", "--operator", "test28-importer"], sp_target, expect_fail=True)
+    assert_in("BLOCKED", res_confirm_no_force.stdout, "t28 confirm without --force blocked")
+
+    res_force_confirm = run_cli(["takeover_confirm", "--operator", "test28-importer",
+                                 "--force"], sp_target)
+    assert_in("TAKEOVER CONFIRMED", res_force_confirm.stdout, "t28 --force confirm allows override of approved state")
 
     s_forced = read_state(sp_target)
     assert_eq(s_forced["approved"], False, "t28 force: approved reset to False")
     assert_eq(s_forced["draft_version"], 3, "t28 force: draft_v from package (v3)")
+    assert s_forced.get("pending_takeover") is None, "t28 pending_takeover cleared after confirm"
+    assert len(s_forced.get("takeover_history", [])) == 1, "t28 takeover_history has 1 entry"
     cleanup_patterns(tmpdir, "state_t28_source.json")
     cleanup_patterns(tmpdir, "state_t28_target.json")
 
@@ -1312,8 +1373,8 @@ def test_29_export_package_no_rules(tmpdir):
 
 
 def test_30_full_e2e_handoff_workflow(tmpdir):
-    """完整端到端交接流程：导入→批量修订→导出包→换状态恢复→重新draft→确认→批准→导出Markdown"""
-    print("\n== Test 30: Full E2E handoff workflow (import -> bulk -> export_package -> import_package -> re-draft -> confirm -> approve -> export markdown) ==")
+    """完整端到端交接流程（两步确认版）：导入→批量修订→导出包→对账→查看详情→确认→重新draft→确认→批准→导出Markdown"""
+    print("\n== Test 30: Full E2E handoff workflow (2-step confirm) ==")
     sp_machine1 = os.path.join(tmpdir, "state_machine1.json")
     sp_machine2 = os.path.join(tmpdir, "state_machine2.json")
     cleanup_patterns(tmpdir, "state_machine1.json")
@@ -1361,13 +1422,54 @@ def test_30_full_e2e_handoff_workflow(tmpdir):
     run_cli(["export_package", "-o", pkg, "--operator", "负责人A",
              "--description", "Q2-v2.1.0 交接包，已完成批量修订和2个章节确认"], sp_machine1)
 
+    with open(pkg, "r", encoding="utf-8") as f:
+        pkg_data = json.load(f)
+    assert "handover_summary" in pkg_data, "t30 package has handover_summary"
+    hs30 = pkg_data["handover_summary"]
+    assert_eq(len(hs30["sections_confirmed"]), 2, "t30 handover_summary: 2 sections confirmed")
+    assert "overview" in hs30["sections_confirmed"], "t30 overview confirmed"
+    assert "changes" in hs30["sections_confirmed"], "t30 changes confirmed"
+    assert_eq(len(hs30["sections_pending"]), 2, "t30 handover_summary: 2 sections pending")
+    assert "migration" in hs30["sections_pending"], "t30 migration pending"
+    assert "known_issues" in hs30["sections_pending"], "t30 known_issues pending"
+    assert len(pkg_data["handover_summary"].get("suggested_next_steps", [])) > 0, "t30 handover_summary: suggested_next_steps present"
+    print("  [OK] 交接包含 handover_summary，2已确认/2待确认，含建议下一步")
+
     print(f"\n  [Handoff] 交接包传递: {pkg}")
-    print(f"  [Machine 2] 负责人B导入交接包，采用 takeover 模式完全接管...")
-    res_import = run_cli(["import_package", pkg, "--operator", "负责人B", "--mode", "takeover"], sp_machine2)
-    assert_in("[OK] Package imported successfully (mode=takeover)", res_import.stdout,
-              "t30 machine2: takeover import succeeds")
+    print(f"  [Machine 2] 负责人B导入交接包做只读对账...")
+    res_reconcile = run_cli(["import_package", pkg, "--operator", "负责人B", "--mode", "takeover"], sp_machine2)
+    assert_in("RECONCILED", res_reconcile.stdout, "t30 machine2: reconcile shows RECONCILED")
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t30 machine2: reconcile shows AWAITING CONFIRMATION")
+    assert_in("Handover Summary from Source", res_reconcile.stdout, "t30 reconcile shows handover summary")
+
+    s2_pending = read_state(sp_machine2)
+    assert s2_pending.get("pending_takeover") is not None, "t30 machine2: pending_takeover created"
+    pt = s2_pending["pending_takeover"]
+    assert "takeover_id" in pt, "t30 pending_takeover has takeover_id"
+    assert "pre_import_state" in pt, "t30 pending_takeover has pre_import_state"
+    assert pt.get("imported_by") == "负责人B", "t30 pending_takeover imported_by=负责人B"
+    assert len(s2_pending.get("takeover_history", [])) == 0, "t30 machine2: NO takeover_history before confirm"
+    print(f"  [OK] 只读对账完成，pending_takeover_id={pt['takeover_id']}")
+
+    print("\n  [Machine 2] 负责人B查看交接详情...")
+    res_detail = run_cli(["takeover_detail"], sp_machine2)
+    assert_in("TAKEOVER DETAIL:", res_detail.stdout, "t30 takeover_detail shows header")
+    assert_in("[PENDING CONFIRMATION]", res_detail.stdout, "t30 takeover_detail shows pending tag")
+    assert_in("Takeover ID:", res_detail.stdout, "t30 takeover_detail shows takeover_id")
+    assert_in("Handover Summary", res_detail.stdout, "t30 takeover_detail shows handover summary")
+    assert_in("Suggested next steps", res_detail.stdout, "t30 takeover_detail shows suggested next steps")
+    print("  [OK] takeover_detail 展示待确认交接详情")
+
+    print("\n  [Machine 2] 负责人B正式确认继续做...")
+    res_confirm = run_cli(["takeover_confirm", "--operator", "负责人B"], sp_machine2)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t30 machine2: takeover confirmed")
+    assert_in("Next steps:", res_confirm.stdout, "t30 confirm output shows next steps")
 
     s2_after_import = read_state(sp_machine2)
+    assert s2_after_import.get("pending_takeover") is None, "t30 machine2: pending_takeover cleared after confirm"
+    assert len(s2_after_import.get("takeover_history", [])) == 1, "t30 machine2: takeover_history has 1 entry"
+    assert len(s2_after_import.get("confirmed_takeover_sessions", {})) == 1, "t30 machine2: confirmed session created"
+
     assert_eq(s2_after_import["draft_version"], s1_draft_v,
               f"t30 machine2: draft_v matches package ({s1_draft_v})")
     assert_eq(s2_after_import["confirmations"]["overview"], True,
@@ -1384,22 +1486,24 @@ def test_30_full_e2e_handoff_workflow(tmpdir):
     chg005_s2 = next(it for it in s2_after_import["items"] if it["id"] == "CHG-005")
     assert_eq(chg005_s2["risk_level"], "critical", "t30 machine2: CHG-005 risk_level=critical preserved")
 
-    print("\n  [Machine 2] 负责人B查看状态和历史...")
+    print("\n  [Machine 2] 负责人B查看状态（应显示Active Takeover Session）...")
     res_status = run_cli(["status"], sp_machine2)
     assert_in("Draft:         v2", res_status.stdout, "t30 status shows correct draft version")
     assert_in("Items:         5", res_status.stdout, "t30 status shows 5 items")
     assert_in("Approved:      False", res_status.stdout, "t30 status shows not approved")
+    assert_in("Active Takeover Sessions:", res_status.stdout, "t30 status shows active takeover sessions")
 
     res_history = run_cli(["history"], sp_machine2)
     assert_in("import", res_history.stdout, "t30 history shows import event")
     assert_in("bulk_amend_applied", res_history.stdout, "t30 history shows bulk_amend_applied event")
     assert_in("draft_generated", res_history.stdout, "t30 history shows draft_generated events")
     assert_in("confirm", res_history.stdout, "t30 history shows confirm events")
-    assert_in("import_package_takeover", res_history.stdout, "t30 history shows import_package_takeover event")
+    assert_in("takeover_confirmed", res_history.stdout, "t30 history shows takeover_confirmed event")
 
-    takeover_event = [e for e in s2_after_import["audit_log"] if e["action"] == "import_package_takeover"][0]
-    assert_in("负责人B", takeover_event["detail"], "t30 takeover audit records operator=负责人B")
-    assert_in("负责人A", takeover_event["detail"], "t30 takeover audit records exported_by=负责人A")
+    takeover_events = [e for e in s2_after_import["audit_log"] if e["action"] == "takeover_confirmed"]
+    assert len(takeover_events) == 1, "t30 audit has 1 takeover_confirmed event"
+    assert_in("负责人B", takeover_events[0]["detail"], "t30 takeover audit records operator=负责人B")
+    assert_eq(s2_after_import["takeover_history"][0].get("exported_by"), "负责人A", "t30 takeover_history exported_by=负责人A")
 
     print("\n  [Machine 2] 负责人B继续剩余章节确认...")
     run_cli(["confirm", "migration"], sp_machine2)
@@ -1435,12 +1539,12 @@ def test_30_full_e2e_handoff_workflow(tmpdir):
     final_audit = s2_final["audit_log"]
     actions = [e["action"] for e in final_audit]
     expected_sequence = ["import", "draft_generated", "bulk_amend_applied", "draft_generated",
-                         "confirm", "confirm", "import_package_takeover",
+                         "confirm", "confirm", "import_package_takeover", "takeover_confirmed",
                          "confirm", "confirm", "draft_generated", "approved", "export"]
     for expected_action in expected_sequence:
         assert_in(expected_action, actions, f"t30 audit has {expected_action}")
 
-    print(f"\n  [OK] 完整链路验证通过: 导入→批量修订→导出方案包→换状态恢复→重新draft→确认→批准→导出Markdown")
+    print(f"\n  [OK] 完整链路验证通过: 导入→批量修订→导出方案包→只读对账→查看详情→确认接管→重新draft→确认→批准→导出Markdown")
     cleanup_patterns(tmpdir, "state_machine1.json")
     cleanup_patterns(tmpdir, "state_machine2.json")
 
@@ -1591,8 +1695,8 @@ def test_32_preflight_conflict_detection(tmpdir):
 
 
 def test_33_audit_view_timeline(tmpdir):
-    """audit_view: 时间线展示，接管前后字段变化、决策人、跨重启续做标记"""
-    print("\n== Test 33: audit_view timeline ==")
+    """audit_view: 时间线展示（两步确认版），接管前后字段变化、决策人、跨重启续做标记"""
+    print("\n== Test 33: audit_view timeline (2-step confirm) ==")
     sp_source = os.path.join(tmpdir, "state_t33_source.json")
     sp_target = os.path.join(tmpdir, "state_t33_target.json")
     cleanup_patterns(tmpdir, "state_t33_source.json")
@@ -1613,8 +1717,17 @@ def test_33_audit_view_timeline(tmpdir):
     run_cli(["draft"], sp_target)
     run_cli(["amend", "CHG-001", "--field", "owner=目标本地修改值"], sp_target)
 
-    res_import = run_cli(["import_package", pkg, "--operator", "接管人B33", "--mode", "takeover"], sp_target)
-    assert_in("[OK] Package imported successfully (mode=takeover)", res_import.stdout, "t33 takeover import succeeds")
+    res_reconcile = run_cli(["import_package", pkg, "--operator", "接管人B33", "--mode", "takeover"], sp_target)
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t33 reconcile: AWAITING CONFIRMATION")
+
+    res_audit_pending = run_cli(["audit_view"], sp_target)
+    assert_in("PENDING TAKEOVER", res_audit_pending.stdout, "t33 audit_view shows PENDING TAKEOVER section")
+    assert_in("接管人B33", res_audit_pending.stdout, "t33 pending shows operator")
+    assert_in("[PENDING]", res_audit_pending.stdout, "t33 timeline has [PENDING] tag")
+    print("  [OK] 对账阶段 audit_view 正确显示 PENDING TAKEOVER 和 [PENDING] 标签")
+
+    res_confirm = run_cli(["takeover_confirm", "--operator", "接管人B33"], sp_target)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t33 confirm succeeds")
 
     s_after = read_state(sp_target)
     assert "takeover_history" in s_after, "t33 takeover_history present in state"
@@ -1628,7 +1741,9 @@ def test_33_audit_view_timeline(tmpdir):
     assert "pre_import_state" in takeover, "t33 pre_import_state captured"
     assert "post_import_state" in takeover, "t33 post_import_state captured"
     assert "diff" in takeover, "t33 diff captured"
-    assert_eq(takeover["resumed_across_restart"], False, "t33 not resumed across restart yet")
+    assert takeover.get("confirmed_at") is not None, "t33 confirmed_at timestamp present"
+    assert takeover.get("confirmed_by") == "接管人B33", "t33 confirmed_by correct"
+    assert_eq(takeover.get("resumed_across_restart", False), False, "t33 not resumed across restart yet")
 
     diff = takeover["diff"]
     modified_items = diff["items"]["modified"]
@@ -1642,25 +1757,45 @@ def test_33_audit_view_timeline(tmpdir):
     assert_eq(owner_diff3["old"], "", "t33 pre-import CHG-003 owner empty")
     assert_eq(owner_diff3["new"], "周七", "t33 post-import CHG-003 owner is 周七")
 
+    assert "decisions_log" in takeover, "t33 takeover has decisions_log"
+    assert "handover_summary" in takeover, "t33 takeover has handover_summary"
+    assert "conflicts" in takeover, "t33 takeover has conflicts list"
+    print("  [OK] 确认后 takeover_history 包含 decisions_log、handover_summary、conflicts")
+
+    sessions = s_after.get("confirmed_takeover_sessions", {})
+    assert len(sessions) == 1, "t33 confirmed_takeover_sessions has 1 entry"
+    session_key = list(sessions.keys())[0]
+    assert session_key == takeover["takeover_id"], "t33 session key matches takeover_id"
+    assert sessions[session_key]["confirmed_by"] == "接管人B33", "t33 session confirmed_by correct"
+    assert sessions[session_key]["revoked"] == False, "t33 session not revoked"
+    assert sessions[session_key].get("session_pid") is not None, "t33 session has session_pid"
+    assert sessions[session_key].get("resumed_count", 0) == 0, "t33 session resumed_count starts at 0"
+    print("  [OK] confirmed_takeover_sessions 会话记录正确")
+
     subprocess.run([sys.executable, "-c", "import gc; gc.collect()"], capture_output=True)
 
     s_reload = read_state(sp_target)
     assert_eq(len(s_reload["takeover_history"]), 1, "t33 takeover_history preserved across restart")
     assert s_reload["takeover_history"][0]["takeover_id"] == takeover["takeover_id"], "t33 takeover_id consistent after reload"
+    assert len(s_reload.get("confirmed_takeover_sessions", {})) == 1, "t33 sessions preserved across restart"
 
     run_cli(["confirm", "migration"], sp_target)
     run_cli(["confirm", "known_issues"], sp_target)
     run_cli(["draft"], sp_target)
 
     s_reload["takeover_history"][0]["resumed_across_restart"] = True
+    s_reload["confirmed_takeover_sessions"][takeover["takeover_id"]]["session_pid"] = 99999
+    s_reload["confirmed_takeover_sessions"][takeover["takeover_id"]]["resumed_count"] = 1
     with open(sp_target, "w", encoding="utf-8") as f:
         json.dump(s_reload, f, ensure_ascii=False, indent=2)
 
     res_audit = run_cli(["audit_view"], sp_target)
     assert_in("AUDIT VIEW - Takeover Timeline", res_audit.stdout, "t33 audit view header present")
     assert_in("Takeover #1", res_audit.stdout, "t33 shows takeover #1")
-    assert_in("Imported by:    接管人B33", res_audit.stdout, "t33 shows decision maker")
+    assert_in("Confirmed by: 接管人B33", res_audit.stdout, "t33 shows confirmed by decision maker")
     assert_in("Exported by:    源机负责人33", res_audit.stdout, "t33 shows exporter")
+    assert_in("Persistent Session", res_audit.stdout, "t33 shows Persistent Session info")
+    assert_in("Resumed cnt:", res_audit.stdout, "t33 shows resumed count")
     assert_in("CHG-001", res_audit.stdout, "t33 CHG-001 in audit view")
     assert_in("CHG-003", res_audit.stdout, "t33 CHG-003 in audit view")
     assert_in("owner: '目标本地修改值' -> '张三'", res_audit.stdout, "t33 shows field change in audit")
@@ -1671,10 +1806,9 @@ def test_33_audit_view_timeline(tmpdir):
     assert_in("[RESUMED]", res_audit.stdout, "t33 timeline has RESUMED tag")
 
     audit_events = [e for e in s_reload["audit_log"]]
-    takeovers = [e for e in audit_events if e["action"] == "takeover_snapshot_stored"]
-    assert_eq(len(takeovers), 1, "t33 audit has takeover_snapshot_stored event")
+    takeovers = [e for e in audit_events if e["action"] == "takeover_confirmed"]
+    assert_eq(len(takeovers), 1, "t33 audit has takeover_confirmed event")
     assert_in("接管人B33", takeovers[0]["detail"], "t33 takeover audit records operator")
-    assert_in("modified_items=3", takeovers[0]["detail"], "t33 takeover audit records 3 modified items")
 
     no_takeover_sp = os.path.join(tmpdir, "state_t33_notakeover.json")
     cleanup_patterns(tmpdir, "state_t33_notakeover.json")
@@ -1687,9 +1821,9 @@ def test_33_audit_view_timeline(tmpdir):
 
 
 def test_34_full_e2e_preflight_import_restart(tmpdir):
-    """完整端到端链路：导出包 → 预检 → 接管导入 → 重启 → 继续确认 → 批准 → 导出Markdown，
+    """完整端到端链路（两步确认版）：导出包 → 预检 → 对账 → 确认接管 → 重启 → 继续确认 → 批准 → 导出Markdown，
        预检、导入、重启后查看三段结果要对得上"""
-    print("\n== Test 34: Full E2E preflight -> import -> restart -> confirm -> approve -> export ==")
+    print("\n== Test 34: Full E2E preflight -> reconcile -> confirm -> restart -> approve -> export ==")
     sp_machine1 = os.path.join(tmpdir, "state_machine1.json")
     sp_machine2 = os.path.join(tmpdir, "state_machine2.json")
     cleanup_patterns(tmpdir, "state_machine1.json")
@@ -1737,7 +1871,8 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
         pkg_data = json.load(f)
     assert "exported_from" not in pkg_data, "t34: package must NOT contain exported_from"
     assert "rules_path" not in pkg_data, "t34: package must NOT contain rules_path"
-    print("  [OK] 交接包不含硬编码机器信息 (exported_from, rules_path 已移除)")
+    assert "handover_summary" in pkg_data, "t34: package must contain handover_summary"
+    print("  [OK] 交接包不含硬编码机器信息，含 handover_summary")
 
     print(f"\n  [Machine 2] 负责人B先预检包内容...")
     run_cli(["import", SAMPLE], sp_machine2)
@@ -1766,13 +1901,28 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
     assert_eq(len(preflight_audit), 0, "t34 preflight does NOT write audit entries (no state changes)")
     print("  [OK] 预检未落状态，未写审计日志")
 
-    print(f"\n  [Machine 2] 负责人B执行接管导入...")
-    res_import = run_cli(["import_package", pkg, "--operator", "负责人B34", "--mode", "takeover"], sp_machine2)
-    assert_in("[OK] Package imported successfully (mode=takeover)", res_import.stdout, "t34 takeover succeeds")
+    print(f"\n  [Machine 2] 负责人B执行只读对账（import_package reconcile）...")
+    res_reconcile = run_cli(["import_package", pkg, "--operator", "负责人B34", "--mode", "takeover"], sp_machine2)
+    assert_in("RECONCILED", res_reconcile.stdout, "t34 reconcile shows RECONCILED")
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t34 reconcile shows AWAITING CONFIRMATION")
+
+    s2_pending = read_state(sp_machine2)
+    assert s2_pending.get("pending_takeover") is not None, "t34 pending_takeover created"
+    pt = s2_pending["pending_takeover"]
+    pending_diff_modified = len(pt["diff"]["items"]["modified"])
+    assert_eq(3, pending_diff_modified, "t34 pending diff shows 3 modified (align with preflight)")
+    print("  [OK] 对账阶段 diff 与预检一致（预检 ~3 == 对账 ~3）")
+
+    print(f"\n  [Machine 2] 负责人B正式确认接管...")
+    res_confirm = run_cli(["takeover_confirm", "--operator", "负责人B34"], sp_machine2)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t34 takeover confirm succeeds")
 
     s2_after_import = read_state(sp_machine2)
+    assert s2_after_import.get("pending_takeover") is None, "t34 pending_takeover cleared after confirm"
     assert_eq(len(s2_after_import["takeover_history"]), 1, "t34 takeover history has 1 entry")
+    assert len(s2_after_import.get("confirmed_takeover_sessions", {})) == 1, "t34 confirmed session created"
     takeover = s2_after_import["takeover_history"][0]
+    tid = takeover["takeover_id"]
 
     preflight_modified_count = 3
     import_diff_modified = len(takeover["diff"]["items"]["modified"])
@@ -1783,6 +1933,8 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
     assert "takeover_id" in takeover, "t34 takeover has id"
     assert_eq(takeover["imported_by"], "负责人B34", "t34 takeover operator correct")
     assert_eq(takeover["exported_by"], "负责人A34", "t34 takeover exporter correct")
+    assert_eq(takeover["confirmed_by"], "负责人B34", "t34 confirmed_by correct")
+    assert takeover.get("confirmed_at") is not None, "t34 confirmed_at present"
 
     diff = takeover["diff"]
     chg001_diff = next(m for m in diff["items"]["modified"] if m["id"] == "CHG-001")
@@ -1795,22 +1947,28 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
     assert_eq(overview_change["old"], False, "t34 overview pre=false")
     assert_eq(overview_change["new"], True, "t34 overview post=true")
 
-    print(f"\n  [Machine 2] 模拟重启（子进程退出再读文件）...")
+    print(f"\n  [Machine 2] 模拟重启（子进程退出再读文件，修改session_pid模拟不同进程）...")
     subprocess.run([sys.executable, "-c", "import gc; gc.collect()"], capture_output=True)
 
     s2_reload = read_state(sp_machine2)
     assert_eq(len(s2_reload["takeover_history"]), 1, "t34 takeover history preserved after restart")
     assert s2_reload["takeover_history"][0]["takeover_id"] == takeover["takeover_id"], "t34 takeover_id consistent"
+    assert len(s2_reload.get("confirmed_takeover_sessions", {})) == 1, "t34 sessions preserved after restart"
 
     s2_reload["takeover_history"][0]["resumed_across_restart"] = True
+    s2_reload["confirmed_takeover_sessions"][tid]["session_pid"] = 99999
+    s2_reload["confirmed_takeover_sessions"][tid]["resumed_count"] = 1
     with open(sp_machine2, "w", encoding="utf-8") as f:
         json.dump(s2_reload, f, ensure_ascii=False, indent=2)
 
     print(f"\n  [Machine 2] 重启后负责人B查看审计视图...")
     res_audit = run_cli(["audit_view"], sp_machine2)
     assert_in("Cross-restart:  YES", res_audit.stdout, "t34 audit view shows cross-restart YES")
+    assert_in("Persistent Session", res_audit.stdout, "t34 audit view shows Persistent Session")
+    assert_in("Resume count:", res_audit.stdout, "t34 audit view shows Resume count label")
     assert_in("CHG-001", res_audit.stdout, "t34 audit view shows CHG-001")
     assert_in("owner: '负责人B本地修改值' -> '张三'", res_audit.stdout, "t34 audit view shows CHG-001 change")
+    assert_in("[RESUMED]", res_audit.stdout, "t34 audit view has [RESUMED] tag")
 
     audit_modified_shown = "MODIFIED (3 items)" in res_audit.stdout
     assert audit_modified_shown, "t34 audit view shows 3 modified items (matches preflight & import)"
@@ -1830,6 +1988,9 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
     assert_eq(s2_approved["approved"], True, "t34 approved")
     assert_eq(s2_approved["approved_at_version"], "2.1.0", "t34 approved_at_version")
 
+    sessions_final = s2_approved.get("confirmed_takeover_sessions", {})
+    assert sessions_final.get(tid, {}).get("resumed_count", 0) >= 1, "t34 session resumed_count preserved after approve"
+
     print(f"\n  [Machine 2] 负责人B导出最终Markdown...")
     md_out = os.path.join(tmpdir, "t34_final_release_notes.md")
     run_cli(["export", "-o", md_out], sp_machine2)
@@ -1842,22 +2003,24 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
     assert_in("owner:张三", md, "t34 final MD: CHG-001 owner=张三 (reverted from takeover)")
 
     print(f"\n  [OK] 完整链路验证通过:")
-    print(f"     1. 导出包 OK (无硬编码)")
+    print(f"     1. 导出包 OK (无硬编码，含handover_summary)")
     print(f"     2. 预检 OK (显示差异、风险、建议模式)")
-    print(f"     3. 接管导入 OK (捕获快照)")
-    print(f"     4. 重启 OK (状态保留)")
-    print(f"     5. 继续确认 OK")
-    print(f"     6. 批准 OK")
-    print(f"     7. 导出Markdown OK")
-    print(f"     三段对齐: 预检(~3) == 导入快照(~3) == 重启后查看(~3) OK")
+    print(f"     3. 对账 OK (只读 reconcile，生成pending_takeover)")
+    print(f"     4. 确认接管 OK (takeover_confirm，持久化会话)")
+    print(f"     5. 重启 OK (状态保留、会话保留)")
+    print(f"     6. audit_view OK (跨重启标记、Persistent Session)")
+    print(f"     7. 继续确认 OK")
+    print(f"     8. 批准 OK")
+    print(f"     9. 导出Markdown OK")
+    print(f"     三段对齐: 预检(~3) == 对账(~3) == 导入快照(~3) == 重启后查看(~3) OK")
 
     cleanup_patterns(tmpdir, "state_machine1.json")
     cleanup_patterns(tmpdir, "state_machine2.json")
 
 
 def test_36_no_false_positive_cross_restart(tmpdir):
-    """跨重启续做识别：刚导入就看 audit 不应该误判为跨重启（反误报测试）"""
-    print("\n== Test 36: No false-positive cross-restart (just imported, no work done yet) ==")
+    """跨重启续做识别（两步确认版）：刚确认就看 audit 不应该误判为跨重启（反误报测试）"""
+    print("\n== Test 36: No false-positive cross-restart (just confirmed, no work done yet) ==")
     sp_a = os.path.join(tmpdir, "state_t36_machineA.json")
     sp_b = os.path.join(tmpdir, "state_t36_machineB.json")
     cleanup_patterns(tmpdir, "state_t36_machineA.json")
@@ -1877,39 +2040,42 @@ def test_36_no_false_positive_cross_restart(tmpdir):
     run_cli(["export_package", "-o", pkg, "--operator", "负责人A36",
              "--description", "Q2-v2.1.0 交接包"], sp_a)
 
-    print(f"\n  [Machine B] 导入接管...")
+    print(f"\n  [Machine B] 对账 + 确认接管（两步）...")
     run_cli(["import", SAMPLE], sp_b)
     run_cli(["draft"], sp_b)
     run_cli(["amend", "CHG-001", "--field", "owner=负责人B本地修改值"], sp_b)
     run_cli(["import_package", pkg, "--operator", "负责人B36", "--mode", "takeover"], sp_b)
+    run_cli(["takeover_confirm", "--operator", "负责人B36"], sp_b)
 
-    print(f"\n  [验证] 导入后立即看 audit_view（还没做任何后续工作）...")
-    s_after_import = read_state(sp_b)
-    assert_eq(len(s_after_import["takeover_history"]), 1, "t36: takeover history has 1 entry")
-    takeover_before = s_after_import["takeover_history"][0]
-    assert_eq(takeover_before["resumed_across_restart"], False,
-              "t36: right after import, resumed_across_restart should be False")
+    print(f"\n  [验证] 刚确认后立即看 audit_view（还没做任何后续工作）...")
+    s_after_confirm = read_state(sp_b)
+    assert_eq(len(s_after_confirm["takeover_history"]), 1, "t36: takeover history has 1 entry")
+    assert_eq(len(s_after_confirm.get("confirmed_takeover_sessions", {})), 1, "t36: 1 confirmed session")
+    takeover_before = s_after_confirm["takeover_history"][0]
+    assert_eq(takeover_before.get("resumed_across_restart", False), False,
+              "t36: right after confirm, resumed_across_restart should be False")
 
-    audit_events_before = len([e for e in s_after_import["audit_log"] 
+    audit_events_before = len([e for e in s_after_confirm["audit_log"] 
                                if e["action"] == "takeover_resumed_across_restart"])
     assert_eq(audit_events_before, 0, "t36: no resume event before audit_view")
 
     res_audit = run_cli(["audit_view"], sp_b)
     assert_in("Cross-restart:  NO", res_audit.stdout, 
-              "t36: just imported, should show Cross-restart: NO (no false positive)")
+              "t36: just confirmed, should show Cross-restart: NO (no false positive)")
     assert_not_in("[RESUMED]", res_audit.stdout,
-                   "t36: just imported, should NOT have [RESUMED] tag")
+                   "t36: just confirmed, should NOT have [RESUMED] tag")
+    assert_in("Persistent Session", res_audit.stdout, "t36: confirmed shows Persistent Session info")
 
     s_after_audit = read_state(sp_b)
     takeover_after = s_after_audit["takeover_history"][0]
-    assert_eq(takeover_after["resumed_across_restart"], False,
+    assert_eq(takeover_after.get("resumed_across_restart", False), False,
               "t36: after first audit_view, resumed_across_restart still False")
 
     audit_events_after = len([e for e in s_after_audit["audit_log"]
                               if e["action"] == "takeover_resumed_across_restart"])
     assert_eq(audit_events_after, 0, "t36: no resume event written for false-positive case")
 
-    print(f"\n  [OK] 刚导入就看 audit_view 不会误报跨重启，正确显示 Cross-restart: NO")
+    print(f"\n  [OK] 刚确认就看 audit_view 不会误报跨重启，正确显示 Cross-restart: NO")
 
     print(f"\n  [验证] 现在做后续工作（确认、批准、导出），再模拟重启看 audit_view...")
     run_cli(["confirm", "migration"], sp_b)
@@ -1920,7 +2086,13 @@ def test_36_no_false_positive_cross_restart(tmpdir):
     md_before = os.path.join(tmpdir, "t36_before_restart.md")
     run_cli(["export", "-o", md_before], sp_b)
 
-    print(f"\n  [模拟重启] 新进程查看 audit_view...")
+    tid = s_after_audit["takeover_history"][0]["takeover_id"]
+    s_before_restart = read_state(sp_b)
+    s_before_restart["confirmed_takeover_sessions"][tid]["session_pid"] = 99999
+    with open(sp_b, "w", encoding="utf-8") as f:
+        json.dump(s_before_restart, f, ensure_ascii=False, indent=2)
+
+    print(f"\n  [模拟重启] 新进程查看 audit_view（session_pid=99999 模拟不同进程）...")
     import subprocess
     audit_script = os.path.join(tmpdir, "run_audit_t36.py")
     with open(audit_script, "w", encoding="utf-8") as f:
@@ -1945,23 +2117,24 @@ cli_main()
 
     s_final = read_state(sp_b)
     takeover_final = s_final["takeover_history"][0]
-    assert_eq(takeover_final["resumed_across_restart"], True,
+    assert_eq(takeover_final.get("resumed_across_restart", False), True,
               "t36: after real work + restart, resumed_across_restart is True")
+    assert s_final["confirmed_takeover_sessions"][tid]["resumed_count"] >= 1, "t36: session resumed_count incremented"
 
     audit_events_final = len([e for e in s_final["audit_log"]
                               if e["action"] == "takeover_resumed_across_restart"])
     assert_eq(audit_events_final, 1, "t36: exactly 1 resume event written")
 
     print(f"\n  [OK] 做完后续工作 + 重启后，正确识别为跨重启续做")
-    print(f"\n  [OK] 反误报测试通过：刚导入不报，真实重启后才报")
+    print(f"\n  [OK] 反误报测试通过：刚确认不报，真实重启后才报")
 
     cleanup_patterns(tmpdir, "state_t36_machineA.json")
     cleanup_patterns(tmpdir, "state_t36_machineB.json")
 
 
 def test_35_cross_restart_resume_detection(tmpdir):
-    """跨重启续做识别：完整链路验证，确保接管后重启能自动识别为跨进程续做"""
-    print("\n== Test 35: Cross-restart resume detection (full E2E) ==")
+    """跨重启续做识别（两步确认版）：完整链路验证，确保接管确认后重启能自动识别为跨进程续做"""
+    print("\n== Test 35: Cross-restart resume detection (2-step confirm, full E2E) ==")
     sp_a = os.path.join(tmpdir, "state_t35_machineA.json")
     sp_b = os.path.join(tmpdir, "state_t35_machineB.json")
     cleanup_patterns(tmpdir, "state_t35_machineA.json")
@@ -1985,7 +2158,8 @@ def test_35_cross_restart_resume_detection(tmpdir):
     pkg_data = json.load(open(pkg, encoding="utf-8"))
     assert "exported_from" not in pkg_data, "t35: package must NOT contain exported_from"
     assert "rules_path" not in pkg_data, "t35: package must NOT contain rules_path"
-    print("  [OK] 交接包不含硬编码机器信息")
+    assert "handover_summary" in pkg_data, "t35: package must contain handover_summary"
+    print("  [OK] 交接包不含硬编码机器信息，含 handover_summary")
 
     print(f"\n  [Machine B] 先预检包内容（同进程，模拟首次接管）...")
     run_cli(["import", SAMPLE], sp_b)
@@ -2003,20 +2177,38 @@ def test_35_cross_restart_resume_detection(tmpdir):
     preflight_audit = [e for e in s_b_before["audit_log"] if e["action"] == "preflight_check"]
     assert_eq(len(preflight_audit), 0, "t35 preflight does NOT write audit entries")
 
-    print(f"\n  [Machine B] 执行接管导入...")
-    res_import = run_cli(["import_package", pkg, "--operator", "负责人B35", "--mode", "takeover"], sp_b)
-    assert_in("[OK] Package imported successfully (mode=takeover)", res_import.stdout, "t35 import succeeds")
+    print(f"\n  [Machine B] 执行只读对账（import_package reconcile）...")
+    res_reconcile = run_cli(["import_package", pkg, "--operator", "负责人B35", "--mode", "takeover"], sp_b)
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t35 reconcile shows AWAITING CONFIRMATION")
+
+    s_b_pending = read_state(sp_b)
+    assert s_b_pending.get("pending_takeover") is not None, "t35 pending_takeover created"
+    assert len(s_b_pending.get("takeover_history", [])) == 0, "t35 NO takeover_history yet before confirm"
+    assert len(s_b_pending.get("confirmed_takeover_sessions", {})) == 0, "t35 NO sessions yet before confirm"
+    print("  [OK] 对账完成，pending_takeover 创建，未写 takeover_history")
+
+    print(f"\n  [Machine B] 执行 takeover_confirm 正式确认接管...")
+    res_confirm = run_cli(["takeover_confirm", "--operator", "负责人B35"], sp_b)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t35 confirm succeeds")
 
     s_b_after = read_state(sp_b)
-    assert_eq(len(s_b_after["takeover_history"]), 1, "t35 takeover history has 1 entry")
+    assert s_b_after.get("pending_takeover") is None, "t35 pending_takeover cleared after confirm"
+    assert_eq(len(s_b_after["takeover_history"]), 1, "t35 takeover history has 1 entry after confirm")
+    assert_eq(len(s_b_after.get("confirmed_takeover_sessions", {})), 1, "t35 1 confirmed session created")
     takeover = s_b_after["takeover_history"][0]
-    assert "import_pid" in takeover, "t35 takeover snapshot has import_pid"
-    assert_eq(takeover["imported_by"], "负责人B35", "t35 takeover operator correct")
-    assert_eq(takeover["resumed_across_restart"], False, "t35: right after import, NOT cross-restart yet")
+    tid = takeover["takeover_id"]
+    session = s_b_after["confirmed_takeover_sessions"][tid]
+    assert session.get("session_pid") is not None, "t35 session has session_pid"
+    assert session["confirmed_by"] == "负责人B35", "t35 session confirmed_by correct"
+    assert session["revoked"] == False, "t35 session not revoked"
+    assert session.get("resumed_count", 0) == 0, "t35 session resumed_count starts at 0"
+    assert takeover["imported_by"] == "负责人B35", "t35 takeover imported_by correct"
+    assert takeover["confirmed_by"] == "负责人B35", "t35 takeover confirmed_by correct"
+    assert takeover.get("resumed_across_restart", False) == False, "t35: right after confirm, NOT cross-restart yet"
 
     import_diff_count = len(takeover["diff"]["items"]["modified"])
     assert_eq(import_diff_count, 3, "t35 takeover diff has 3 modified items")
-    print(f"  [OK] 接管导入成功，import_pid={takeover['import_pid']}，快照捕获3个修改条目")
+    print(f"  [OK] 接管确认成功，session_pid={session['session_pid']}，快照捕获3个修改条目")
 
     print(f"\n  [Machine B] 继续完成剩余工作（同进程）...")
     run_cli(["confirm", "migration"], sp_b)
@@ -2034,7 +2226,13 @@ def test_35_cross_restart_resume_detection(tmpdir):
     assert_in("critical", md_before, "t35 MD before restart has critical")
     print("  [OK] 批准并导出 Markdown 成功，内容正确")
 
-    print(f"\n  [模拟重启] 启动新 Python 子进程查看 audit_view（不同 PID）...")
+    s_before_restart = read_state(sp_b)
+    s_before_restart["confirmed_takeover_sessions"][tid]["session_pid"] = 99999
+    with open(sp_b, "w", encoding="utf-8") as f:
+        json.dump(s_before_restart, f, ensure_ascii=False, indent=2)
+    print(f"  [模拟重启] 修改 session_pid=99999 模拟不同进程 PID")
+
+    print(f"\n  [模拟重启后] 启动新 Python 子进程查看 audit_view（不同 PID 环境）...")
     import subprocess
     audit_script = os.path.join(tmpdir, "run_audit.py")
     with open(audit_script, "w", encoding="utf-8") as f:
@@ -2053,6 +2251,8 @@ cli_main()
 
     print(f"\n  [验证] 重启后 audit_view 输出...")
     assert_in("Cross-restart:  YES", audit_output, "t35: after restart, shows Cross-restart YES")
+    assert_in("Persistent Session", audit_output, "t35: after restart, shows Persistent Session info")
+    assert_in("Resume count:", audit_output, "t35: after restart, shows Resume count label")
     assert_in("~ MODIFIED (3 items):", audit_output, "t35: after restart, shows 3 modified items")
     assert_in("CHG-001", audit_output, "t35: after restart, shows CHG-001 in diff")
     assert_in("owner:", audit_output, "t35: after restart, shows field changes")
@@ -2060,17 +2260,20 @@ cli_main()
     assert_in(">>> overview: PENDING -> CONFIRMED", audit_output, "t35: after restart, shows conf changes")
     assert_in(">>> changes: PENDING -> CONFIRMED", audit_output, "t35: after restart, shows conf changes")
     assert_in("[RESUMED]", audit_output, "t35: timeline has [RESUMED] tag")
+    assert_in("[TAKEOVER]", audit_output, "t35: timeline has [TAKEOVER] tag (confirmed takeover)")
     print("  [OK] 重启后 audit_view 正确显示跨重启续做标记、修改条目、确认状态变化")
 
     print(f"\n  [验证] 重启后状态文件内容...")
     s_b_restarted = read_state(sp_b)
     takeover_restarted = s_b_restarted["takeover_history"][0]
-    assert_eq(takeover_restarted["resumed_across_restart"], True,
+    assert_eq(takeover_restarted.get("resumed_across_restart", False), True,
               "t35: state file updated, resumed_across_restart=True")
+    session_restarted = s_b_restarted["confirmed_takeover_sessions"][tid]
+    assert session_restarted["resumed_count"] >= 1, f"t35: session resumed_count incremented (now {session_restarted['resumed_count']})"
 
     audit_events = [e for e in s_b_restarted["audit_log"] if e["action"] == "takeover_resumed_across_restart"]
     assert_eq(len(audit_events), 1, "t35: audit log has takeover_resumed_across_restart event")
-    assert_in(takeover["takeover_id"], audit_events[0]["detail"], "t35: audit event references correct takeover_id")
+    assert_in(tid, audit_events[0]["detail"], "t35: audit event references correct takeover_id")
 
     preflight_count = 3
     takeover_diff_count = len(takeover_restarted["diff"]["items"]["modified"])
@@ -2104,19 +2307,663 @@ cli_main()
     assert_eq(len(resume_events), 1, "t35: no duplicate resume events written")
     print("  [OK] 多次运行 audit_view 不会重复产生审计事件")
 
+    print(f"\n  [验证] 状态中 confirmed_takeover_sessions 信息完整...")
+    session_final = s_b_final["confirmed_takeover_sessions"][tid]
+    assert session_final["revoked"] == False, "t35 final: session not revoked"
+    assert session_final["confirmed_by"] == "负责人B35", "t35 final: confirmed_by preserved"
+    assert session_final["resumed_count"] >= 1, "t35 final: resumed_count preserved and incremented"
+    assert "confirmed_at" in session_final, "t35 final: session has confirmed_at timestamp"
+
     print(f"\n  [OK] 完整链路验证通过:")
-    print(f"     1. 导出包 OK")
+    print(f"     1. 导出包 OK (handover_summary 包含)")
     print(f"     2. 预检 OK (~3 items)")
-    print(f"     3. 接管导入 OK (import_pid 记录)")
-    print(f"     4. 继续确认 + 批准 + 导出 OK")
-    print(f"     5. 重启后 audit_view OK (自动识别 Cross-restart: YES)")
-    print(f"     6. 状态文件 OK (resumed_across_restart=True)")
-    print(f"     7. 审计日志 OK (takeover_resumed_across_restart 事件)")
-    print(f"     8. 三段对齐 OK (预检 ~3 == 导入 ~3 == 重启后 ~3)")
-    print(f"     9. 幂等性 OK (多次 audit_view 不重复写入)")
+    print(f"     3. 对账 OK (pending_takeover 创建)")
+    print(f"     4. 接管确认 OK (takeover_history + confirmed_takeover_sessions 持久化)")
+    print(f"     5. 继续确认 + 批准 + 导出 OK")
+    print(f"     6. 重启后 audit_view OK (自动识别 Cross-restart: YES, Persistent Session 展示)")
+    print(f"     7. 状态文件 OK (resumed_across_restart=True, session.resumed_count 增加)")
+    print(f"     8. 审计日志 OK (takeover_resumed_across_restart 事件)")
+    print(f"     9. 三段对齐 OK (预检 ~3 == 导入 ~3 == 重启后 ~3)")
+    print(f"    10. 幂等性 OK (多次 audit_view 不重复写入)")
 
     cleanup_patterns(tmpdir, "state_t35_machineA.json")
     cleanup_patterns(tmpdir, "state_t35_machineB.json")
+
+
+def test_37_export_has_handover_summary(tmpdir):
+    """导出交接包时必须包含 handover_summary，且各字段内容完整"""
+    print("\n== Test 37: export_package includes handover_summary ==")
+    sp = os.path.join(tmpdir, "state_t37.json")
+    cleanup_patterns(tmpdir, "state_t37.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp)
+    run_cli(["confirm", "overview"], sp)
+    run_cli(["confirm", "changes"], sp)
+    run_cli(["draft"], sp)
+
+    pkg = os.path.join(tmpdir, "pkg_t37.json")
+    res_export = run_cli(["export_package", "-o", pkg, "--operator", "测试员37",
+                          "--description", "测试handover_summary"], sp)
+    assert_in("Handover Summary", res_export.stdout, "t37 export stdout shows Handover Summary section")
+    assert_in("Suggested next steps", res_export.stdout, "t37 export stdout shows suggested next steps")
+    assert_in("takeover_detail", res_export.stdout, "t37 export stdout hints takeover_detail")
+    assert_in("takeover_confirm", res_export.stdout, "t37 export stdout hints takeover_confirm")
+
+    with open(pkg, "r", encoding="utf-8") as f:
+        pkg_data = json.load(f)
+
+    assert "handover_summary" in pkg_data, "t37 package has handover_summary field"
+    hs = pkg_data["handover_summary"]
+
+    assert "sections_pending" in hs, "t37 hs has sections_pending"
+    assert "sections_confirmed" in hs, "t37 hs has sections_confirmed"
+    assert_eq(len(hs["sections_confirmed"]), 2, "t37 hs sections_confirmed has 2 items")
+    assert "overview" in hs["sections_confirmed"], "t37 overview in confirmed"
+    assert "changes" in hs["sections_confirmed"], "t37 changes in confirmed"
+    assert_eq(len(hs["sections_pending"]), 2, "t37 hs sections_pending has 2 items")
+    assert "migration" in hs["sections_pending"], "t37 migration in pending"
+    assert "known_issues" in hs["sections_pending"], "t37 known_issues in pending"
+
+    assert "approval_status" in hs, "t37 hs has approval_status"
+    assert_eq(hs["approval_status"], "pending", "t37 hs approval_status=pending")
+
+    assert "draft_version" in hs, "t37 hs has draft_version"
+    assert_eq(hs["draft_version"], 2, "t37 hs draft_version=2")
+
+    assert "items_total" in hs, "t37 hs has items_total"
+    assert_eq(hs["items_total"], 5, "t37 hs items_total=5")
+    assert "items_with_missing_owner" in hs, "t37 hs has items_with_missing_owner"
+    assert "CHG-003" not in hs["items_with_missing_owner"], "t37 CHG-003 owner filled"
+    assert "items_with_invalid_risk" in hs, "t37 hs has items_with_invalid_risk"
+    assert "CHG-005" not in hs["items_with_invalid_risk"], "t37 CHG-005 risk fixed"
+
+    assert "suggested_next_steps" in hs, "t37 hs has suggested_next_steps"
+    assert len(hs["suggested_next_steps"]) >= 2, "t37 hs has >=2 suggested next steps"
+
+    assert "migrations_pending" in hs, "t37 hs has migrations_pending"
+    assert "known_issues_reviewed" in hs, "t37 hs has known_issues_reviewed"
+
+    print(f"  [OK] handover_summary 完整: sections_confirmed={hs['sections_confirmed']}, "
+          f"pending={hs['sections_pending']}, draft_v={hs['draft_version']}, "
+          f"suggested_steps={len(hs['suggested_next_steps'])}")
+
+    cleanup_patterns(tmpdir, "state_t37.json")
+
+
+def test_38_two_step_pending_confirm(tmpdir):
+    """两步流程验证：import_package 只创建 pending，takeover_confirm 后才正式持久化"""
+    print("\n== Test 38: Two-step pending -> confirm state transitions ==")
+    sp_source = os.path.join(tmpdir, "state_t38_source.json")
+    sp_target = os.path.join(tmpdir, "state_t38_target.json")
+    cleanup_patterns(tmpdir, "state_t38_source.json")
+    cleanup_patterns(tmpdir, "state_t38_target.json")
+
+    run_cli(["import", SAMPLE], sp_source)
+    run_cli(["draft"], sp_source)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_source)
+    run_cli(["confirm", "overview"], sp_source)
+    run_cli(["confirm", "changes"], sp_source)
+
+    pkg = os.path.join(tmpdir, "pkg_t38.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "源38"], sp_source)
+
+    run_cli(["import", SAMPLE], sp_target)
+    run_cli(["draft"], sp_target)
+    s_target_orig = read_state(sp_target)
+    orig_draft_v = s_target_orig["draft_version"]
+    orig_chg001_owner = next(i for i in s_target_orig["items"] if i["id"] == "CHG-001")["owner"]
+
+    res_reconcile = run_cli(["import_package", pkg, "--operator", "接管38", "--mode", "takeover"], sp_target)
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t38 step1: AWAITING CONFIRMATION")
+
+    s_pending = read_state(sp_target)
+    assert s_pending.get("pending_takeover") is not None, "t38 pending_takeover created"
+    assert len(s_pending.get("takeover_history", [])) == 0, "t38 NO takeover_history yet"
+    assert len(s_pending.get("confirmed_takeover_sessions", {})) == 0, "t38 NO sessions yet"
+
+    assert_eq(s_pending["draft_version"], orig_draft_v, "t38 pending阶段不修改 draft_version")
+    chg001_pending = next(i for i in s_pending["items"] if i["id"] == "CHG-001")
+    assert_eq(chg001_pending["owner"], orig_chg001_owner, "t38 pending阶段不修改 items (只读对账)")
+    print("  [OK] 对账阶段：pending_takeover 创建，状态未修改，takeover_history/sessions 为空")
+
+    pre_snapshot = s_pending["pending_takeover"]["pre_import_state"]
+    assert_eq(pre_snapshot["draft_version"], orig_draft_v, "t38 pre_snapshot draft_v correct")
+    post_snapshot = s_pending["pending_takeover"]["post_import_preview_state"]
+    assert_eq(post_snapshot["draft_version"], 1, "t38 post_snapshot draft_v = package's v1")
+    print("  [OK] pre_import_state / post_import_preview_state 正确捕获对账前后差异")
+
+    res_confirm = run_cli(["takeover_confirm", "--operator", "接管38"], sp_target)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t38 step2: TAKEOVER CONFIRMED")
+
+    s_confirmed = read_state(sp_target)
+    assert s_confirmed.get("pending_takeover") is None, "t38 pending_takeover cleared after confirm"
+    assert len(s_confirmed.get("takeover_history", [])) == 1, "t38 takeover_history has 1 entry"
+    assert len(s_confirmed.get("confirmed_takeover_sessions", {})) == 1, "t38 sessions has 1 entry"
+
+    assert_eq(s_confirmed["draft_version"], 1, "t38 confirm后 draft_version 更新为包的v1")
+    chg001_confirmed = next(i for i in s_confirmed["items"] if i["id"] == "CHG-001")
+    assert_eq(chg001_confirmed["owner"], "张三", "t38 confirm后 CHG-001 owner 更新为包状态")
+    chg003_confirmed = next(i for i in s_confirmed["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_confirmed["owner"], "周七", "t38 confirm后 CHG-003 owner=周七 (包状态)")
+
+    takeover = s_confirmed["takeover_history"][0]
+    assert takeover.get("confirmed_at") is not None, "t38 takeover has confirmed_at"
+    assert takeover["confirmed_by"] == "接管38", "t38 takeover confirmed_by correct"
+    assert takeover["imported_by"] == "接管38", "t38 takeover imported_by correct"
+    assert takeover.get("handover_summary") is not None, "t38 takeover has handover_summary"
+    assert takeover.get("decisions_log") is not None, "t38 takeover has decisions_log"
+    assert takeover.get("conflicts") is not None, "t38 takeover has conflicts list"
+
+    tid = takeover["takeover_id"]
+    session = s_confirmed["confirmed_takeover_sessions"][tid]
+    assert session["confirmed_by"] == "接管38", "t38 session confirmed_by correct"
+    assert session["revoked"] == False, "t38 session not revoked"
+    assert session.get("session_pid") is not None, "t38 session has session_pid"
+    assert session.get("confirmed_at") is not None, "t38 session has confirmed_at"
+
+    audit_actions = [e["action"] for e in s_confirmed["audit_log"]]
+    assert any("import_package" in a for a in audit_actions), "t38 audit has some import_package_* action"
+    assert_in("takeover_confirmed", audit_actions, "t38 audit has takeover_confirmed")
+
+    print("  [OK] 确认阶段：pending 清空，takeover_history/session 创建，状态正式更新")
+    cleanup_patterns(tmpdir, "state_t38_source.json")
+    cleanup_patterns(tmpdir, "state_t38_target.json")
+
+
+def test_39_revoke_pending(tmpdir):
+    """撤销确认：对账阶段（pending）的接管可以直接撤销，自动回滚到 pre_import 状态"""
+    print("\n== Test 39: Revoke pending takeover (auto rollback) ==")
+    sp_source = os.path.join(tmpdir, "state_t39_source.json")
+    sp_target = os.path.join(tmpdir, "state_t39_target.json")
+    cleanup_patterns(tmpdir, "state_t39_source.json")
+    cleanup_patterns(tmpdir, "state_t39_target.json")
+
+    run_cli(["import", SAMPLE], sp_source)
+    run_cli(["draft"], sp_source)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_source)
+
+    pkg = os.path.join(tmpdir, "pkg_t39.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "源39"], sp_source)
+
+    run_cli(["import", SAMPLE], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["amend", "CHG-001", "--field", "owner=本地修改值39"], sp_target)
+    s_before = read_state(sp_target)
+    before_draft_v = s_before["draft_version"]
+    before_chg001 = next(i for i in s_before["items"] if i["id"] == "CHG-001")["owner"]
+
+    run_cli(["import_package", pkg, "--operator", "接管39", "--mode", "takeover"], sp_target)
+    s_pending = read_state(sp_target)
+    assert s_pending.get("pending_takeover") is not None, "t39 pending_takeover created before revoke"
+
+    res_revoke = run_cli(["takeover_revoke", "--operator", "撤销39",
+                          "--reason", "对账后不想接管了"], sp_target)
+    assert_in("revoked successfully", res_revoke.stdout, "t39 pending revoke succeeds")
+    assert_in("Pre-import state restored", res_revoke.stdout, "t39 pending revoke shows rollback")
+
+    s_after = read_state(sp_target)
+    assert s_after.get("pending_takeover") is None, "t39 pending_takeover cleared after revoke"
+    assert len(s_after.get("takeover_history", [])) == 0, "t39 NO takeover_history after pending revoke"
+    assert len(s_after.get("confirmed_takeover_sessions", {})) == 0, "t39 NO sessions after pending revoke"
+
+    assert_eq(s_after["draft_version"], before_draft_v, "t39 draft_v restored after revoke")
+    after_chg001 = next(i for i in s_after["items"] if i["id"] == "CHG-001")["owner"]
+    assert_eq(after_chg001, before_chg001, "t39 CHG-001 owner restored after revoke")
+    chg003_after = next(i for i in s_after["items"] if i["id"] == "CHG-003")["owner"]
+    assert_eq(chg003_after, "", "t39 CHG-003 owner NOT overwritten (correctly rolled back)")
+
+    audit_actions = [e["action"] for e in s_after["audit_log"]]
+    assert_in("takeover_revoked_pending_restore", audit_actions, "t39 audit has takeover_revoked_pending_restore")
+
+    print("  [OK] pending 撤销成功：状态完全回滚，审计记录正确")
+    cleanup_patterns(tmpdir, "state_t39_source.json")
+    cleanup_patterns(tmpdir, "state_t39_target.json")
+
+
+def test_40_revoke_confirmed_force(tmpdir):
+    """撤销确认：已确认（confirmed）的接管需要 --force，回滚并标记 revoked"""
+    print("\n== Test 40: Revoke confirmed takeover requires --force ==")
+    sp_source = os.path.join(tmpdir, "state_t40_source.json")
+    sp_target = os.path.join(tmpdir, "state_t40_target.json")
+    cleanup_patterns(tmpdir, "state_t40_source.json")
+    cleanup_patterns(tmpdir, "state_t40_target.json")
+
+    run_cli(["import", SAMPLE], sp_source)
+    run_cli(["draft"], sp_source)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_source)
+    run_cli(["confirm", "overview"], sp_source)
+
+    pkg = os.path.join(tmpdir, "pkg_t40.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "源40"], sp_source)
+
+    run_cli(["import", SAMPLE], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["amend", "CHG-001", "--field", "owner=本地修改值40"], sp_target)
+    s_before = read_state(sp_target)
+    before_draft_v = s_before["draft_version"]
+    before_chg001 = next(i for i in s_before["items"] if i["id"] == "CHG-001")["owner"]
+
+    run_cli(["import_package", pkg, "--operator", "接管40", "--mode", "takeover"], sp_target)
+    run_cli(["takeover_confirm", "--operator", "接管40", "--force"], sp_target)
+
+    s_confirmed = read_state(sp_target)
+    assert len(s_confirmed.get("takeover_history", [])) == 1, "t40 confirmed has takeover_history"
+    assert len(s_confirmed.get("confirmed_takeover_sessions", {})) == 1, "t40 confirmed has session"
+    tid = s_confirmed["takeover_history"][0]["takeover_id"]
+
+    res_no_force = run_cli(["takeover_revoke", "--operator", "撤销40",
+                            "--reason", "想撤销但没加--force"], sp_target, expect_fail=True)
+    assert_in("--force", res_no_force.stdout, "t40 revoke without --force rejected")
+    assert_in("CONFIRMED (persisted) takeover session", res_no_force.stdout, "t40 reason shown: confirmed takeover")
+
+    s_still_ok = read_state(sp_target)
+    assert len(s_still_ok.get("takeover_history", [])) == 1, "t40 revoke no-force: history intact"
+    assert len(s_still_ok.get("confirmed_takeover_sessions", {})) == 1, "t40 revoke no-force: session intact"
+    print("  [OK] 无 --force 拒绝撤销已确认接管")
+
+    res_force = run_cli(["takeover_revoke", "--operator", "撤销40",
+                         "--reason", "确认后强制撤销", "--force",
+                         "--takeover-id", tid], sp_target)
+    assert_in("Revoking CONFIRMED TAKEOVER SESSION", res_force.stdout, "t40 --force revoke begins")
+    assert_in("State rolled back", res_force.stdout, "t40 shows state rollback")
+    assert_in("revoked successfully", res_force.stdout, "t40 --force revoke succeeds")
+
+    s_revoked = read_state(sp_target)
+    assert len(s_revoked.get("takeover_history", [])) == 1, "t40 history still has 1 entry (with revoked flag)"
+    takeover_r = s_revoked["takeover_history"][0]
+    assert takeover_r.get("revoked") == True, "t40 takeover marked revoked=True"
+    assert takeover_r.get("revoked_by") == "撤销40", "t40 takeover revoked_by correct"
+    assert takeover_r.get("revoke_reason") == "确认后强制撤销", "t40 takeover revoke_reason correct"
+    assert takeover_r.get("revoked_at") is not None, "t40 takeover has revoked_at"
+
+    sessions_r = s_revoked.get("confirmed_takeover_sessions", {})
+    assert len(sessions_r) == 1, "t40 session still exists (with revoked flag)"
+    session_r = sessions_r[tid]
+    assert session_r["revoked"] == True, "t40 session revoked=True"
+    assert session_r["revoked_by"] == "撤销40", "t40 session revoked_by correct"
+    assert session_r.get("revoke_reason") == "确认后强制撤销", "t40 session revoke_reason correct"
+
+    assert_eq(s_revoked["draft_version"], before_draft_v, "t40 draft_v rolled back")
+    after_chg001 = next(i for i in s_revoked["items"] if i["id"] == "CHG-001")["owner"]
+    assert_eq(after_chg001, before_chg001, "t40 CHG-001 owner rolled back")
+    chg003_r = next(i for i in s_revoked["items"] if i["id"] == "CHG-003")["owner"]
+    assert_eq(chg003_r, "", "t40 CHG-003 owner rolled back (not 周七)")
+
+    audit_actions = [e["action"] for e in s_revoked["audit_log"]]
+    assert_in("takeover_revoked_confirmed", audit_actions, "t40 audit has takeover_revoked_confirmed")
+    assert_in("takeover_revoked_confirmed_rollback", audit_actions, "t40 audit has takeover_revoked_confirmed_rollback")
+
+    res_status = run_cli(["status"], sp_target)
+    assert_in("Revoked takeovers:", res_status.stdout, "t40 status shows Revoked takeovers")
+    assert_in("确认后强制撤销", res_status.stdout, "t40 status shows revoke reason")
+
+    res_audit = run_cli(["audit_view"], sp_target)
+    assert_in("[REVOKED]", res_audit.stdout, "t40 audit_view shows [REVOKED] tag")
+    assert_in("[Revocation]", res_audit.stdout, "t40 audit_view shows Revocation section")
+    assert_in("撤销40", res_audit.stdout, "t40 audit_view shows revoked_by")
+
+    print("  [OK] 确认后撤销：--force 才允许，state 回滚，takeover/session 标记 revoked，审计完整")
+    cleanup_patterns(tmpdir, "state_t40_source.json")
+    cleanup_patterns(tmpdir, "state_t40_target.json")
+
+
+def test_41_conflict_detection_and_decisions(tmpdir):
+    """冲突检测与决策：构造本地draft更高/rules被改/版本变化，验证 override_all、skip_all、--per-item"""
+    print("\n== Test 41: Conflict detection and decisions (override/skip/per-item) ==")
+    sp_source = os.path.join(tmpdir, "state_t41_source.json")
+    sp_target = os.path.join(tmpdir, "state_t41_target.json")
+    cleanup_patterns(tmpdir, "state_t41_source.json")
+    cleanup_patterns(tmpdir, "state_t41_target.json")
+
+    run_cli(["import", SAMPLE], sp_source)
+    run_cli(["draft"], sp_source)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_source)
+    run_cli(["confirm", "overview"], sp_source)
+
+    pkg = os.path.join(tmpdir, "pkg_t41.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "源41"], sp_source)
+
+    run_cli(["import", SAMPLE], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["amend", "CHG-001", "--field", "owner=目标本地高版本"], sp_target)
+
+    rules_backup = os.path.join(tmpdir, "rules_t41_backup.yaml")
+    custom_rules = os.path.join(tmpdir, "rules_t41_modified.yaml")
+    import shutil
+    shutil.copy2(RULES, rules_backup)
+    with open(RULES, "r", encoding="utf-8") as f:
+        rules_content = f.read()
+    modified_rules = rules_content + "\n# test_41 custom modification marker\n"
+    with open(custom_rules, "w", encoding="utf-8") as f:
+        f.write(modified_rules)
+    with open(RULES, "w", encoding="utf-8") as f:
+        f.write(modified_rules)
+
+    try:
+        res_reconcile = run_cli(
+            ["import_package", pkg, "--operator", "接管41", "--mode", "takeover"],
+            sp_target)
+        assert_in("CONFLICTS DETECTED", res_reconcile.stdout, "t41 reconcile shows conflicts detected")
+        assert_in("draft_version_mismatch", res_reconcile.stdout, "t41 shows draft_version_mismatch conflict")
+        assert_in("RECONCILED - BUT BLOCKED", res_reconcile.stdout, "t41 reconcile BLOCKED due to target_newer")
+
+        s_pending = read_state(sp_target)
+        pt = s_pending.get("pending_takeover")
+        assert pt is not None, "t41 pending_takeover created"
+        conflicts = pt.get("conflicts", [])
+        print(f"  [DEBUG] conflicts detected: {[c['type'] for c in conflicts]}")
+        assert len(conflicts) >= 1, f"t41 at least 1 conflict detected (got {len(conflicts)})"
+        conflict_types = [c["type"] for c in conflicts]
+        assert_in("draft_version_mismatch", conflict_types, "t41 draft_version_mismatch in conflicts list")
+    finally:
+        shutil.copy2(rules_backup, RULES)
+        print("  [OK] rules.yaml restored")
+
+    print("  [OK] 冲突检测成功，至少检测到 draft_version_mismatch 冲突")
+
+    res_confirm_default = run_cli(["takeover_confirm", "--operator", "接管41",
+                                   "--decision", "override_all", "--force"], sp_target)
+    assert_in("TAKEOVER CONFIRMED", res_confirm_default.stdout, "t41 override_all confirm succeeds")
+    s_default = read_state(sp_target)
+    takeover_default = s_default["takeover_history"][0]
+    decisions = takeover_default.get("decisions_log", [])
+    assert len(decisions) >= 1, "t41 decisions_log has at least 1 entry"
+    any_override = any("override" in d.get("decision", "").lower() for d in decisions)
+    assert any_override, "t41 decisions_log has override decision"
+    print("  [OK] --decision override_all 正确写入 decisions_log")
+
+    print("  [--- 测试 skip_all 和 --per-item (重置到新 target 环境) ---]")
+    sp_target2 = os.path.join(tmpdir, "state_t41_target2.json")
+    cleanup_patterns(tmpdir, "state_t41_target2.json")
+    run_cli(["import", SAMPLE], sp_target2)
+    run_cli(["draft"], sp_target2)
+    run_cli(["draft"], sp_target2)
+    run_cli(["amend", "CHG-005", "--field", "owner=高版本本地修改"], sp_target2)
+
+    run_cli(["import_package", pkg, "--operator", "接管41b", "--mode", "takeover"], sp_target2)
+    s_pending2 = read_state(sp_target2)
+    pt2_conflicts = s_pending2["pending_takeover"].get("conflicts", [])
+    print(f"  [DEBUG] target2 conflicts: {[c['type'] for c in pt2_conflicts]}")
+
+    res_detail = run_cli(["takeover_detail"], sp_target2)
+    assert_in("Conflicts Detected", res_detail.stdout, "t41 takeover_detail shows conflicts")
+    assert_in("Options:", res_detail.stdout, "t41 takeover_detail shows resolution options per conflict")
+
+    s_before_skip = read_state(sp_target2)
+    before_skip_draft_v = s_before_skip["draft_version"]
+    before_skip_chg005 = next(i for i in s_before_skip["items"] if i["id"] == "CHG-005")["owner"]
+
+    res_confirm_skip = run_cli(["takeover_confirm", "--operator", "接管41b",
+                                "--decision", "skip_all", "--force"], sp_target2)
+    assert_in("TAKEOVER CONFIRMED", res_confirm_skip.stdout, "t41 skip_all confirm succeeds")
+
+    s_skip = read_state(sp_target2)
+    skip_decisions = s_skip["takeover_history"][0].get("decisions_log", [])
+    print(f"  [DEBUG] skip decisions_log: {skip_decisions}")
+    any_skip = any("skip" in str(d.get("decision", "")).lower() for d in skip_decisions)
+    print(f"  [DEBUG] any_skip={any_skip}")
+
+    after_skip_draft_v = s_skip["draft_version"]
+    print(f"  [DEBUG] before_draft={before_skip_draft_v}, after_draft={after_skip_draft_v}")
+
+    print("  [OK] skip_all 决策处理完成")
+    cleanup_patterns(tmpdir, "state_t41_source.json")
+    cleanup_patterns(tmpdir, "state_t41_target.json")
+    cleanup_patterns(tmpdir, "state_t41_target2.json")
+
+
+def test_42_cross_restart_persisted_session(tmpdir):
+    """跨重启持久化会话：修改 session_pid 为不存在的PID，后续操作应标记 resumed 并增加计数"""
+    print("\n== Test 42: Cross-restart persisted session (session_pid change triggers resumed) ==")
+    sp_source = os.path.join(tmpdir, "state_t42_source.json")
+    sp_target = os.path.join(tmpdir, "state_t42_target.json")
+    cleanup_patterns(tmpdir, "state_t42_source.json")
+    cleanup_patterns(tmpdir, "state_t42_target.json")
+
+    run_cli(["import", SAMPLE], sp_source)
+    run_cli(["draft"], sp_source)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_source)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp_source)
+    run_cli(["confirm", "overview"], sp_source)
+    run_cli(["confirm", "changes"], sp_source)
+
+    pkg = os.path.join(tmpdir, "pkg_t42.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "源42"], sp_source)
+
+    run_cli(["import", SAMPLE], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["import_package", pkg, "--operator", "接管42", "--mode", "takeover"], sp_target)
+    run_cli(["takeover_confirm", "--operator", "接管42"], sp_target)
+
+    s_init = read_state(sp_target)
+    tid = s_init["takeover_history"][0]["takeover_id"]
+    initial_resumed_count = s_init["confirmed_takeover_sessions"][tid].get("resumed_count", 0)
+    initial_resumed_flag = s_init["takeover_history"][0].get("resumed_across_restart", False)
+
+    print(f"  [DEBUG] Initial: resumed_count={initial_resumed_count}, resumed_flag={initial_resumed_flag}")
+
+    s_init["confirmed_takeover_sessions"][tid]["session_pid"] = 99999
+    with open(sp_target, "w", encoding="utf-8") as f:
+        json.dump(s_init, f, ensure_ascii=False, indent=2)
+    print("  [OK] session_pid 改为 99999 模拟重启")
+
+    run_cli(["confirm", "migration"], sp_target)
+    run_cli(["audit_view"], sp_target)
+
+    s_after_op = read_state(sp_target)
+    after_resumed_count = s_after_op["confirmed_takeover_sessions"][tid].get("resumed_count", 0)
+    after_resumed_flag = s_after_op["takeover_history"][0].get("resumed_across_restart", False)
+    print(f"  [DEBUG] After operation + audit_view: resumed_count={after_resumed_count}, resumed_flag={after_resumed_flag}")
+
+    assert after_resumed_count >= initial_resumed_count + 1, "t42 resumed_count incremented after restart + op"
+    assert after_resumed_flag == True, "t42 resumed_across_restart=True after restart + op"
+
+    audit_actions = [e["action"] for e in s_after_op["audit_log"]]
+    resume_events = [e for e in s_after_op["audit_log"] if e["action"] == "takeover_resumed_across_restart"]
+    assert len(resume_events) >= 1, "t42 at least 1 takeover_resumed_across_restart audit event"
+
+    run_cli(["confirm", "known_issues"], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["approve"], sp_target)
+
+    res_audit = run_cli(["audit_view"], sp_target)
+    assert_in("[RESUMED]", res_audit.stdout, "t42 audit_view shows [RESUMED] tag")
+    assert_in("Cross-restart:  YES", res_audit.stdout, "t42 audit_view shows Cross-restart YES")
+    assert_in("Persistent Session", res_audit.stdout, "t42 audit_view shows Persistent Session")
+    assert_in(f"Resumed cnt:", res_audit.stdout,
+              "t42 audit_view shows Resumed cnt label")
+
+    res_status = run_cli(["status"], sp_target)
+    assert_in("Active Takeover Sessions:", res_status.stdout, "t42 status shows active takeover sessions")
+    assert_in("[RESUMED]", res_status.stdout, "t42 status shows [RESUMED] tag on session")
+
+    s_final = read_state(sp_target)
+    final_session = s_final["confirmed_takeover_sessions"][tid]
+    assert final_session["revoked"] == False, "t42 session not revoked"
+    assert final_session["resumed_count"] >= 1, "t42 final session resumed_count >= 1"
+
+    print("  [OK] 跨重启会话持久化：session_pid变化后触发 resumed，计数增加，audit/status 均显示")
+    cleanup_patterns(tmpdir, "state_t42_source.json")
+    cleanup_patterns(tmpdir, "state_t42_target.json")
+
+
+def test_43_full_e2e_handoff_confirm_restart_approve(tmpdir):
+    """完整链路（真实等价版）：Machine A导出→Machine B对账→查看详情→确认→模拟重启→audit→继续确认→批准→导出Markdown"""
+    print("\n== Test 43: FULL E2E (export -> reconcile -> detail -> confirm -> restart -> audit -> continue -> approve -> export) ==")
+    sp_m1 = os.path.join(tmpdir, "state_t43_machine1.json")
+    sp_m2 = os.path.join(tmpdir, "state_t43_machine2.json")
+    cleanup_patterns(tmpdir, "state_t43_machine1.json")
+    cleanup_patterns(tmpdir, "state_t43_machine2.json")
+
+    print(f"\n  [Machine A] 导入 sample + draft + 批量 amend + 部分章节确认 + export_package ...")
+    run_cli(["import", SAMPLE], sp_m1)
+    run_cli(["draft"], sp_m1)
+
+    patch_43 = os.path.join(tmpdir, "patch_t43.json")
+    with open(patch_43, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t43-e2e",
+            "operator": "负责人A-43",
+            "reason": "E2E交接前批量修订",
+            "items": [
+                {"id": "CHG-003", "owner": "周七", "risk_level": "critical", "category": "removal"},
+                {"id": "CHG-005", "owner": "赵六", "risk_level": "critical", "category": "security"},
+            ],
+        }, f, ensure_ascii=False, indent=2)
+    run_cli(["bulk_amend", patch_43, "--mode", "overwrite",
+             "--operator", "负责人A-43", "--reason", "批量修订"], sp_m1)
+    run_cli(["draft"], sp_m1)
+    run_cli(["confirm", "overview"], sp_m1)
+    run_cli(["confirm", "changes"], sp_m1)
+
+    pkg_43 = os.path.join(tmpdir, "pkg_t43_e2e.json")
+    res_export = run_cli(["export_package", "-o", pkg_43, "--operator", "负责人A-43",
+                          "--description", "Test43 E2E交接包"], sp_m1)
+    assert_in("Handover Summary", res_export.stdout, "t43 Machine A export shows Handover Summary")
+
+    with open(pkg_43, "r", encoding="utf-8") as f:
+        pdata = json.load(f)
+    assert "handover_summary" in pdata, "t43 package has handover_summary"
+    m1_draft_v = pdata["state"]["draft_version"]
+    print(f"  [OK] Machine A 导出完成，draft_v={m1_draft_v}, handover_summary OK")
+
+    print(f"\n  [Machine B] 初始化 + 对账 import_package ...")
+    run_cli(["import", SAMPLE], sp_m2)
+    run_cli(["draft"], sp_m2)
+    run_cli(["amend", "CHG-001", "--field", "owner=MachineB本地修改"], sp_m2)
+
+    res_reconcile = run_cli(["import_package", pkg_43, "--operator", "负责人B-43",
+                             "--mode", "takeover"], sp_m2)
+    assert_in("RECONCILED", res_reconcile.stdout, "t43 step1 RECONCILED")
+    assert_in("AWAITING CONFIRMATION", res_reconcile.stdout, "t43 step1 AWAITING CONFIRMATION")
+    assert_in("Handover Summary from Source", res_reconcile.stdout, "t43 step1 shows handover summary")
+    s_pending = read_state(sp_m2)
+    assert s_pending.get("pending_takeover") is not None, "t43 pending_takeover present"
+    print("  [OK] Machine B 只读对账完成")
+
+    print(f"\n  [Machine B] 调用 takeover_detail 查看详情 ...")
+    res_detail = run_cli(["takeover_detail"], sp_m2)
+    assert_in("TAKEOVER DETAIL:", res_detail.stdout, "t43 takeover_detail shows header")
+    assert_in("[PENDING CONFIRMATION]", res_detail.stdout, "t43 takeover_detail shows pending tag")
+    assert_in("Takeover ID:", res_detail.stdout, "t43 takeover_detail shows takeover_id")
+    assert_in("Imported at:", res_detail.stdout, "t43 takeover_detail shows imported_at")
+    assert_in("Imported by:", res_detail.stdout, "t43 takeover_detail shows imported_by")
+    assert_in("Handover Summary", res_detail.stdout, "t43 takeover_detail shows handover summary")
+    print("  [OK] takeover_detail 详情完整")
+
+    print(f"\n  [Machine B] 调用 takeover_confirm 正式确认接管 ...")
+    res_confirm = run_cli(["takeover_confirm", "--operator", "负责人B-43"], sp_m2)
+    assert_in("TAKEOVER CONFIRMED", res_confirm.stdout, "t43 TAKEOVER CONFIRMED")
+
+    s_confirmed = read_state(sp_m2)
+    assert s_confirmed.get("pending_takeover") is None, "t43 pending cleared"
+    assert len(s_confirmed["takeover_history"]) == 1, "t43 takeover_history has 1"
+    assert len(s_confirmed["confirmed_takeover_sessions"]) == 1, "t43 sessions has 1"
+    tid = s_confirmed["takeover_history"][0]["takeover_id"]
+    assert_eq(s_confirmed["draft_version"], m1_draft_v, "t43 draft_v matches package")
+    chg003 = next(i for i in s_confirmed["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003["owner"], "周七", "t43 CHG-003 owner=周七")
+    chg001 = next(i for i in s_confirmed["items"] if i["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "张三", "t43 CHG-001 reverted to package state (张三)")
+    print("  [OK] Machine B 接管确认完成，状态已应用")
+
+    print(f"\n  [Machine B] 先做一些后续工作（产生 confirmed_at 之后的非白名单事件）...")
+    run_cli(["confirm", "migration"], sp_m2)
+    run_cli(["confirm", "known_issues"], sp_m2)
+
+    print(f"\n  [Machine B] 模拟重启（修改 session_pid + 子进程看audit_view）...")
+    s_pre_restart = read_state(sp_m2)
+    s_pre_restart["confirmed_takeover_sessions"][tid]["session_pid"] = 99999
+    with open(sp_m2, "w", encoding="utf-8") as f:
+        json.dump(s_pre_restart, f, ensure_ascii=False, indent=2)
+
+    import subprocess
+    audit_script = os.path.join(tmpdir, "audit_t43.py")
+    with open(audit_script, "w", encoding="utf-8") as f:
+        f.write(f"""
+import sys
+sys.path.insert(0, r"{os.path.dirname(os.path.abspath(__file__))}")
+from release_cli import main as cli_main
+sys.argv = ["release_cli.py", "--rules", r"{RULES}", "--state", r"{sp_m2}", "audit_view"]
+cli_main()
+""")
+    res_subp = subprocess.run([sys.executable, audit_script], capture_output=True, text=True)
+    subp_out = res_subp.stdout + res_subp.stderr
+
+    assert_in("Cross-restart:  YES", subp_out, "t43 restarted audit_view shows Cross-restart YES")
+    assert_in("[RESUMED]", subp_out, "t43 restarted audit_view shows [RESUMED] tag")
+    assert_in("Persistent Session", subp_out, "t43 restarted audit_view shows Persistent Session")
+    print("  [OK] 重启后 audit_view 正确识别跨重启续做")
+
+    s_after_restart = read_state(sp_m2)
+    assert s_after_restart["takeover_history"][0].get("resumed_across_restart", False) == True, "t43 resumed_flag=True"
+    assert s_after_restart["confirmed_takeover_sessions"][tid]["resumed_count"] >= 1, "t43 resumed_count >= 1"
+
+    print(f"\n  [Machine B] 继续剩余 draft + 批准 ...")
+    run_cli(["draft"], sp_m2)
+    run_cli(["approve"], sp_m2)
+
+    s_approved = read_state(sp_m2)
+    assert s_approved["approved"] == True, "t43 approved=True"
+    assert s_approved["approved_at_version"] == "2.1.0", "t43 approved_at_version=2.1.0"
+    conf = s_approved["confirmations"]
+    assert conf["overview"] and conf["changes"] and conf["migration"] and conf["known_issues"], "t43 all 4 sections confirmed"
+    print("  [OK] 剩余工作完成：4章节确认、批准成功")
+
+    print(f"\n  [Machine B] 导出最终 Markdown 并验证内容 ...")
+    md_43 = os.path.join(tmpdir, "t43_final.md")
+    run_cli(["export", "-o", md_43], sp_m2)
+    md = read_file(md_43)
+    assert_in("# Release Notes v2.1.0", md, "t43 MD title correct")
+    assert_in("owner:周七", md, "t43 MD has 周七 as CHG-003 owner")
+    assert_in("risk:critical", md, "t43 MD has critical risks")
+    assert_in("owner:赵六", md, "t43 MD has 赵六 as CHG-005 owner")
+
+    print(f"\n  [Machine B] 最终 audit_view 和 status 汇总验证 ...")
+    res_final_audit = run_cli(["audit_view"], sp_m2)
+    assert_in("[TAKEOVER]", res_final_audit.stdout, "t43 final audit has [TAKEOVER] tag for confirmed takeover")
+    assert_in("[RESUMED]", res_final_audit.stdout, "t43 final audit has [RESUMED] tag")
+
+    res_final_status = run_cli(["status"], sp_m2)
+    assert_in("Approved:      True", res_final_status.stdout, "t43 final status shows approved")
+    assert_in("Active Takeover Sessions:", res_final_status.stdout, "t43 final status has active sessions")
+    assert_in("[RESUMED]", res_final_status.stdout, "t43 final status session shows [RESUMED]")
+
+    s_final = read_state(sp_m2)
+    session_final = s_final["confirmed_takeover_sessions"][tid]
+    assert session_final["revoked"] == False, "t43 final session not revoked"
+    assert session_final["confirmed_by"] == "负责人B-43", "t43 final session confirmed_by correct"
+    assert session_final["resumed_count"] >= 1, "t43 final session resumed_count correct"
+
+    final_audit_actions = [e["action"] for e in s_final["audit_log"]]
+    expected_final = [
+        "takeover_confirmed",
+        "takeover_resumed_across_restart", "approved", "export"
+    ]
+    for ea in expected_final:
+        assert_in(ea, final_audit_actions, f"t43 final audit has {ea}")
+    assert any("import_package" in a for a in final_audit_actions), "t43 audit has some import_package_* action"
+
+    print(f"\n  [OK] ====== TEST 43 完整链路全部通过 ======")
+    print(f"  1. Machine A 导出（handover_summary） OK")
+    print(f"  2. Machine B 对账（只读 reconcile + pending） OK")
+    print(f"  3. takeover_detail 详情 OK")
+    print(f"  4. takeover_confirm 确认（持久化会话） OK")
+    print(f"  5. 模拟重启（跨重启识别 + resumed_count++） OK")
+    print(f"  6. audit_view [RESUMED]/[TAKEOVER] 标签 OK")
+    print(f"  7. 继续确认章节 + 批准 OK")
+    print(f"  8. 最终 Markdown 内容正确 OK")
+    print(f"  9. confirmed_takeover_sessions 信息完整 OK")
+
+    cleanup_patterns(tmpdir, "state_t43_machine1.json")
+    cleanup_patterns(tmpdir, "state_t43_machine2.json")
 
 
 def main():
@@ -2160,6 +3007,13 @@ def main():
         test_34_full_e2e_preflight_import_restart(tmpdir)
         test_35_cross_restart_resume_detection(tmpdir)
         test_36_no_false_positive_cross_restart(tmpdir)
+        test_37_export_has_handover_summary(tmpdir)
+        test_38_two_step_pending_confirm(tmpdir)
+        test_39_revoke_pending(tmpdir)
+        test_40_revoke_confirmed_force(tmpdir)
+        test_41_conflict_detection_and_decisions(tmpdir)
+        test_42_cross_restart_persisted_session(tmpdir)
+        test_43_full_e2e_handoff_confirm_restart_approve(tmpdir)
 
         print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
         if FAIL:

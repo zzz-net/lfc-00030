@@ -84,6 +84,9 @@ def _new_state(version, batch_id):
         "audit_log": [],
         "current_batch_id": batch_id,
         "pending_bulk_ops": [],
+        "takeover_history": [],
+        "pending_takeover": None,
+        "confirmed_takeover_sessions": {},
     }
 
 
@@ -112,11 +115,199 @@ def _get_identity():
     return f"{user}@{platform.node()}"
 
 
+def _build_handover_summary(state):
+    items = state.get("items", [])
+    migrations = state.get("migration_reminders", [])
+    known_issues = state.get("known_issues", [])
+    confirmations = state.get("confirmations", {})
+    migration_processed = state.get("migration_processed", {})
+
+    pending_sections = []
+    confirmed_sections = []
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        if confirmations.get(sec, False):
+            confirmed_sections.append(sec)
+        else:
+            pending_sections.append(sec)
+
+    items_with_missing_owner = [
+        it["id"] for it in items if not it.get("owner")
+    ]
+    items_with_invalid_risk = [
+        it["id"] for it in items
+        if it.get("risk_level") not in {"low", "medium", "high", "critical"}
+    ]
+    migrations_pending = [
+        m["id"] for m in migrations
+        if not migration_processed.get(m["id"])
+    ]
+
+    pending_bulk = state.get("pending_bulk_ops", [])
+    unresolved_bulk = [
+        i for i, p in enumerate(pending_bulk) if not p.get("resolved")
+    ]
+
+    suggested_next_steps = []
+    if pending_sections:
+        suggested_next_steps.append(
+            f"Confirm sections: {', '.join(pending_sections)}"
+        )
+    if items_with_missing_owner:
+        suggested_next_steps.append(
+            f"Fill owner for items: {', '.join(items_with_missing_owner)}"
+        )
+    if items_with_invalid_risk:
+        suggested_next_steps.append(
+            f"Fix risk_level for items: {', '.join(items_with_invalid_risk)}"
+        )
+    if migrations_pending:
+        suggested_next_steps.append(
+            f"Process migrations: {', '.join(migrations_pending)}"
+        )
+    if not state.get("known_issues_reviewed", False) and known_issues:
+        suggested_next_steps.append("Review known_issues section")
+    if unresolved_bulk:
+        suggested_next_steps.append(
+            f"Resume bulk amend at indices: {unresolved_bulk}"
+        )
+    if not state.get("approved", False) and not pending_sections:
+        suggested_next_steps.append("Run 'approve' to finalize release")
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "sections_pending": pending_sections,
+        "sections_confirmed": confirmed_sections,
+        "approval_status": "approved" if state.get("approved", False) else "pending",
+        "draft_version": state.get("draft_version", 0),
+        "items_total": len(items),
+        "items_with_missing_owner": items_with_missing_owner,
+        "items_with_invalid_risk": items_with_invalid_risk,
+        "migration_total": len(migrations),
+        "migrations_pending": migrations_pending,
+        "known_issues_total": len(known_issues),
+        "known_issues_reviewed": state.get("known_issues_reviewed", False),
+        "unresolved_bulk_ops": unresolved_bulk,
+        "total_bulk_ops": len(pending_bulk),
+        "suggested_next_steps": suggested_next_steps,
+    }
+
+
+def _detect_takeover_conflicts(local_state, package, rules_path, existing_package_info=None):
+    conflicts = []
+    package_state = package["state"]
+
+    if existing_package_info:
+        if existing_package_info.get("package_checksum") != package.get("state_checksum"):
+            conflicts.append({
+                "type": "package_checksum_changed",
+                "severity": "high",
+                "message": ("Package content has changed since last reconcile "
+                           "(different state_checksum). Re-export from source recommended."),
+                "resolution_options": ["skip", "reimport", "override"],
+            })
+        if existing_package_info.get("exported_at") != package.get("exported_at"):
+            conflicts.append({
+                "type": "package_re_exported",
+                "severity": "high",
+                "message": ("Package has been re-exported at a different time. "
+                           f"Old: {existing_package_info.get('exported_at')} "
+                           f"New: {package.get('exported_at')}"),
+                "resolution_options": ["skip", "reimport", "override"],
+            })
+
+    if local_state is not None:
+        local_dv = local_state.get("draft_version", 0)
+        pkg_dv = package_state.get("draft_version", 0)
+        if local_dv != pkg_dv:
+            conflicts.append({
+                "type": "draft_version_mismatch",
+                "severity": "medium",
+                "message": (f"Draft version mismatch. "
+                           f"Local: v{local_dv}, Package: v{pkg_dv}"),
+                "resolution_options": ["skip", "override"],
+            })
+
+        local_approved = local_state.get("approved", False)
+        pkg_approved = package_state.get("approved", False)
+        if local_approved != pkg_approved:
+            conflicts.append({
+                "type": "approval_status_mismatch",
+                "severity": "high",
+                "message": (f"Approval status mismatch. "
+                           f"Local: {local_approved}, Package: {pkg_approved}"),
+                "resolution_options": ["skip", "override"],
+            })
+
+        local_conf = local_state.get("confirmations", {})
+        pkg_conf = package_state.get("confirmations", {})
+        for sec in set(list(local_conf.keys()) + list(pkg_conf.keys())):
+            if local_conf.get(sec, False) != pkg_conf.get(sec, False):
+                conflicts.append({
+                    "type": "section_confirmation_diff",
+                    "severity": "medium",
+                    "message": (f"Section '{sec}' confirmation differs. "
+                               f"Local: {local_conf.get(sec, False)}, "
+                               f"Package: {pkg_conf.get(sec, False)}"),
+                    "resolution_options": ["skip", "override"],
+                })
+
+        local_ver = local_state.get("version")
+        pkg_ver = package_state.get("version")
+        if local_ver != pkg_ver:
+            conflicts.append({
+                "type": "version_mismatch",
+                "severity": "high",
+                "message": (f"Release version mismatch. "
+                           f"Local: {local_ver}, Package: {pkg_ver}"),
+                "resolution_options": ["skip", "override"],
+            })
+
+        local_items = {it.get("id"): it for it in local_state.get("items", [])}
+        pkg_items = {it.get("id"): it for it in package_state.get("items", [])}
+        diverged_items = []
+        for iid in set(local_items.keys()) & set(pkg_items.keys()):
+            lit = local_items[iid]
+            pit = pkg_items[iid]
+            if (lit.get("_version", 1) != pit.get("_version", 1) or
+                lit.get("_last_modified_at") != pit.get("_last_modified_at")):
+                diverged_items.append(iid)
+        if diverged_items:
+            conflicts.append({
+                "type": "item_divergence",
+                "severity": "high",
+                "message": (f"Some items have diverged between local and package: "
+                           f"{', '.join(diverged_items[:5])}"
+                           f"{' ...' if len(diverged_items) > 5 else ''}"),
+                "resolution_options": ["skip", "override"],
+            })
+
+    rules_diff = _compare_rules_diff(rules_path, package.get("rules_snapshot"))
+    if rules_diff.get("has_rules_snapshot") and not rules_diff.get("identical", True):
+        if rules_diff.get("local_rules_missing"):
+            conflicts.append({
+                "type": "local_rules_missing",
+                "severity": "low",
+                "message": ("Local rules file missing. Package contains a rules snapshot."),
+                "resolution_options": ["skip", "override"],
+            })
+        else:
+            conflicts.append({
+                "type": "rules_differs",
+                "severity": "medium",
+                "message": ("Local rules.yaml differs from package rules snapshot."),
+                "resolution_options": ["skip", "override"],
+            })
+
+    return conflicts
+
+
 def _build_package(state, operator, rules_path, description):
     rules_copy = None
     if rules_path and os.path.exists(rules_path):
         with open(rules_path, "r", encoding="utf-8") as f:
             rules_copy = f.read()
+
+    handover_summary = _build_handover_summary(state)
 
     package = {
         "package_format_version": PACKAGE_FORMAT_VERSION,
@@ -126,6 +317,7 @@ def _build_package(state, operator, rules_path, description):
         "state": copy.deepcopy(state),
         "state_checksum": _compute_state_checksum(state),
         "rules_snapshot": rules_copy,
+        "handover_summary": handover_summary,
         "metadata": {
             "version": state.get("version"),
             "draft_version": state.get("draft_version"),
@@ -616,6 +808,34 @@ def cmd_export_package(args, rules):
     else:
         print(f"   Rules snapshot: excluded")
 
+    summary = package.get("handover_summary", {})
+    print()
+    print(f"== Handover Summary (for receiver) ==")
+    print(f"   Approval status:    {summary.get('approval_status')}")
+    print(f"   Draft version:      v{summary.get('draft_version')}")
+    print(f"   Sections confirmed: {summary.get('sections_confirmed')}")
+    print(f"   Sections pending:   {summary.get('sections_pending')}")
+    print(f"   Items total:        {summary.get('items_total')}")
+    if summary.get('items_with_missing_owner'):
+        print(f"   Items missing owner: {summary.get('items_with_missing_owner')}")
+    if summary.get('items_with_invalid_risk'):
+        print(f"   Items invalid risk:  {summary.get('items_with_invalid_risk')}")
+    print(f"   Migrations:         {summary.get('migration_total')} total, "
+          f"{len(summary.get('migrations_pending', []))} pending")
+    print(f"   Known issues:       {summary.get('known_issues_total')} "
+          f"(reviewed={summary.get('known_issues_reviewed')})")
+    if summary.get('unresolved_bulk_ops'):
+        print(f"   Unresolved bulk:    {summary.get('unresolved_bulk_ops')} "
+              f"(indices: {summary.get('unresolved_bulk_ops')})")
+    next_steps = summary.get('suggested_next_steps', [])
+    if next_steps:
+        print(f"   Suggested next steps:")
+        for s in next_steps:
+            print(f"     - {s}")
+    print()
+    print(f"   Receiver: run 'takeover_detail' after import_package to review this summary.")
+    print(f"   Receiver: run 'takeover_confirm' to officially take over and persist session.")
+
 
 def cmd_import_package(args, rules):
     state_path = args.state
@@ -640,7 +860,10 @@ def cmd_import_package(args, rules):
 
     target_state_snapshot = copy.deepcopy(target_state) if target_state else None
 
-    print(f"\n== Import Package: '{package_path}' ==")
+    print(f"\n{'=' * 70}")
+    print(f"PACKAGE IMPORT - READ-ONLY RECONCILE (NOT YET CONFIRMED)")
+    print(f"{'=' * 70}")
+    print(f"   Package file:    {package_path}")
     print(f"   Package format:  {package['package_format_version']}")
     print(f"   Exported at:     {package.get('exported_at')}")
     print(f"   Exported by:     {package.get('exported_by')}")
@@ -649,101 +872,190 @@ def cmd_import_package(args, rules):
     print(f"   Imported by:     {operator}")
     print()
 
+    age_info = None
     if target_state is not None:
         age_info = _compare_state_age(target_state, package_state)
-        print(f"Target state:      v{target_state.get('version')} / draft v{age_info['target_draft_version']}")
-        print(f"Package state:     v{package_state.get('version')} / draft v{age_info['package_draft_version']}")
-        print(f"Target audit len:  {age_info['target_audit_len']}")
-        print(f"Package audit len: {age_info['package_audit_len']}")
-        print(f"Target approved:   {age_info['target_approved']}")
-        print(f"Package approved:  {age_info['package_approved']}")
+        print(f"[Target State Comparison]")
+        print(f"  Target state:      v{target_state.get('version')} / draft v{age_info['target_draft_version']}")
+        print(f"  Package state:     v{package_state.get('version')} / draft v{age_info['package_draft_version']}")
+        print(f"  Target audit len:  {age_info['target_audit_len']}")
+        print(f"  Package audit len: {age_info['package_audit_len']}")
+        print(f"  Target approved:   {age_info['target_approved']}")
+        print(f"  Package approved:  {age_info['package_approved']}")
         print()
 
         if target_state.get("approved") and not args.force:
-            print("[REJECTED] Target state is already approved.")
-            print("   Use --force to override.")
-            if target_state is not None:
-                _audit(target_state, "import_package_rejected",
-                       f"operator={operator} package={package_path} reason=target_approved")
-                save_state(target_state, state_path)
-            sys.exit(1)
+            print("[BLOCKED] Target state is already approved.")
+            print("   Use --force to override during confirm step.")
 
         if age_info["target_newer"] and not args.force:
-            print("[REJECTED] Target state is NEWER than package state.")
+            print("[BLOCKED] Target state is NEWER than package state.")
             print("   Importing would overwrite newer changes.")
-            print("   Use --force to override, or consider:")
+            print("   Use --force during confirm step to override, or consider:")
             print("     --mode merge    Continue from package state, merging history")
             print("     --mode takeover Completely replace target state with package")
             print()
-            if target_state is not None:
-                _audit(target_state, "import_package_rejected",
-                       f"operator={operator} package={package_path} "
-                       f"reason=target_newer target_score={age_info['target_score']} "
-                       f"package_score={age_info['package_score']}")
-                save_state(target_state, state_path)
-            sys.exit(1)
 
+    summary = package.get("handover_summary", {})
+    if summary:
+        print(f"[Handover Summary from Source]")
+        print(f"  Approval status:    {summary.get('approval_status')}")
+        print(f"  Draft version:      v{summary.get('draft_version')}")
+        print(f"  Sections confirmed: {summary.get('sections_confirmed')}")
+        print(f"  Sections pending:   {summary.get('sections_pending')}")
+        print(f"  Items total:        {summary.get('items_total')}")
+        if summary.get('items_with_missing_owner'):
+            print(f"  Items missing owner: {summary.get('items_with_missing_owner')}")
+        if summary.get('items_with_invalid_risk'):
+            print(f"  Items invalid risk:  {summary.get('items_with_invalid_risk')}")
+        print(f"  Migrations:         {summary.get('migration_total')} total, "
+              f"{len(summary.get('migrations_pending', []))} pending")
+        print(f"  Known issues:       {summary.get('known_issues_total')} "
+              f"(reviewed={summary.get('known_issues_reviewed')})")
+        if summary.get('unresolved_bulk_ops'):
+            print(f"  Unresolved bulk:    indices {summary.get('unresolved_bulk_ops')}")
+        next_steps = summary.get('suggested_next_steps', [])
+        if next_steps:
+            print(f"  Suggested next steps (from source):")
+            for s in next_steps:
+                print(f"    - {s}")
+        print()
+
+    existing_pkg_info = None
+    if target_state and target_state.get("pending_takeover"):
+        existing_pkg_info = {
+            "package_checksum": target_state["pending_takeover"].get("package_checksum"),
+            "exported_at": target_state["pending_takeover"].get("exported_at"),
+        }
+    conflicts = _detect_takeover_conflicts(
+        target_state, package, args.rules, existing_pkg_info
+    )
+
+    if conflicts:
+        print(f"[CONFLICTS DETECTED] ({len(conflicts)})")
+        for i, c in enumerate(conflicts, 1):
+            sev_tag = {
+                "high": "[HIGH]",
+                "medium": "[MED]",
+                "low": "[LOW]",
+            }.get(c.get("severity", "medium"), "[MED]")
+            print(f"  {i}. {sev_tag} {c['type']}: {c['message']}")
+            opts = c.get("resolution_options", [])
+            if opts:
+                print(f"     Resolution options: {', '.join(opts)}")
+        print()
+
+    pre_approved_blocked = (
+        target_state is not None
+        and target_state.get("approved")
+        and not args.force
+    )
+    pre_target_newer_blocked = (
+        age_info is not None
+        and age_info["target_newer"]
+        and not args.force
+    )
+
+    deep_diff = None
     if mode == "takeover":
         if target_state is not None:
-            _audit(package_state, "import_package_takeover",
-                   f"operator={operator} package={package_path} "
-                   f"exported_by={package.get('exported_by')} "
-                   f"exported_at={package.get('exported_at')} "
-                   f"old_version={target_state.get('version')} "
-                   f"old_draft_v={target_state.get('draft_version')} "
-                   f"new_version={package_state.get('version')} "
-                   f"new_draft_v={package_state.get('draft_version')} "
-                   f"force={args.force}")
+            deep_diff = _compute_deep_diff(target_state_snapshot, package_state)
         else:
-            _audit(package_state, "import_package_takeover",
-                   f"operator={operator} package={package_path} "
-                   f"exported_by={package.get('exported_by')} "
-                   f"exported_at={package.get('exported_at')} "
-                   f"new_version={package_state.get('version')} "
-                   f"new_draft_v={package_state.get('draft_version')} "
-                   f"force={args.force}")
-        final_state = package_state
+            deep_diff = None
 
-    elif mode == "merge":
+        if target_state is not None:
+            modified_items = len(deep_diff["items"]["modified"]) if deep_diff else 0
+            added_items = len(deep_diff["items"]["added"]) if deep_diff else 0
+            removed_items = len(deep_diff["items"]["removed"]) if deep_diff else 0
+            print(f"[Takeover Diff Preview]")
+            print(f"  Items: +{added_items} -{removed_items} ~{modified_items}")
+            if deep_diff and deep_diff["metadata"]["version_changed"]:
+                print(f"  Version: {deep_diff['metadata']['version_old']} -> {deep_diff['metadata']['version_new']}")
+            if deep_diff and deep_diff["metadata"]["draft_version_changed"]:
+                print(f"  Draft: v{deep_diff['metadata']['draft_version_old']} -> v{deep_diff['metadata']['draft_version_new']}")
+            if deep_diff and deep_diff["metadata"]["approved_changed"]:
+                print(f"  Approved: {deep_diff['metadata']['approved_old']} -> {deep_diff['metadata']['approved_new']}")
+            print()
+            pending_final_state = package_state
+        else:
+            print(f"[Takeover Diff Preview]")
+            print(f"  Fresh import (no existing target state)")
+            print()
+            pending_final_state = package_state
+    else:
         if target_state is None:
-            _audit(package_state, "import_package_merge",
-                   f"operator={operator} package={package_path} "
-                   f"exported_by={package.get('exported_by')} "
-                   f"exported_at={package.get('exported_at')} "
-                   f"note=no_target_creating_new "
-                   f"version={package_state.get('version')} "
-                   f"draft_v={package_state.get('draft_version')}")
-            final_state = package_state
+            pending_final_state = package_state
         else:
             merged = copy.deepcopy(package_state)
-            merged["audit_log"] = target_state.get("audit_log", []) + [
-                {"timestamp": datetime.now().isoformat(),
-                 "action": "import_package_merge",
-                 "detail": (f"operator={operator} package={package_path} "
-                            f"exported_by={package.get('exported_by')} "
-                            f"exported_at={package.get('exported_at')} "
-                            f"target_audit_len={len(target_state.get('audit_log', []))} "
-                            f"package_audit_len={len(package_state.get('audit_log', []))} "
-                            f"force={args.force}")}
-            ] + package_state.get("audit_log", [])
-
+            merged["audit_log"] = target_state.get("audit_log", []) + package_state.get("audit_log", [])
             if args.keep_target_batches:
                 target_batches = set(target_state.get("imported_batches", []))
                 package_batches = package_state.get("imported_batches", [])
                 merged["imported_batches"] = list(target_batches) + [
                     b for b in package_batches if b not in target_batches
                 ]
+            pending_final_state = merged
+        print(f"[Merge Mode Preview]")
+        print(f"  Target history + package history merged.")
+        print()
 
-            _audit(merged, "import_package_merge",
-                   f"operator={operator} package={package_path} "
-                   f"exported_by={package.get('exported_by')} "
-                   f"exported_at={package.get('exported_at')} "
-                   f"keep_target_batches={args.keep_target_batches} "
-                   f"force={args.force}")
-            final_state = merged
-    else:
-        print(f"[ERROR] Unknown mode '{mode}'. Valid: merge, takeover")
-        sys.exit(1)
+    rules_diff_info = _compare_rules_diff(args.rules, package.get("rules_snapshot"))
+    if rules_diff_info.get("has_rules_snapshot"):
+        if rules_diff_info.get("local_rules_missing"):
+            print(f"[Rules] Package has rules snapshot; local rules file missing.")
+        elif rules_diff_info.get("identical"):
+            print(f"[Rules] Package rules snapshot IDENTICAL to local rules.")
+        else:
+            add_cnt = len(rules_diff_info.get("added", []))
+            rem_cnt = len(rules_diff_info.get("removed", []))
+            print(f"[Rules] Package rules DIFFERS from local: +{add_cnt}/-{rem_cnt} lines.")
+        if args.apply_rules_snapshot:
+            print(f"        --apply-rules-snapshot set: will restore rules during confirm.")
+        print()
+
+    pending_takeover_id = hashlib.sha256(
+        f"{datetime.now().isoformat()}{operator}{package_path}".encode()
+    ).hexdigest()[:16]
+
+    state_for_pending = copy.deepcopy(target_state) if target_state else _new_state(
+        package_state.get("version", "UNKNOWN"),
+        package_state.get("current_batch_id", "pending-batch"),
+    )
+    state_for_pending.setdefault("takeover_history", [])
+    state_for_pending.setdefault("confirmed_takeover_sessions", {})
+    state_for_pending["pending_takeover"] = {
+        "takeover_id": pending_takeover_id,
+        "imported_at": datetime.now().isoformat(),
+        "imported_by": operator,
+        "import_pid": os.getpid(),
+        "exported_by": package.get("exported_by"),
+        "exported_at": package.get("exported_at"),
+        "package_path": os.path.basename(package_path),
+        "package_path_full": package_path,
+        "package_checksum": package.get("state_checksum"),
+        "package_format_version": package.get("package_format_version"),
+        "mode": mode,
+        "force": args.force,
+        "apply_rules_snapshot": args.apply_rules_snapshot,
+        "keep_target_batches": args.keep_target_batches,
+        "handover_summary": summary,
+        "pre_import_state": target_state_snapshot,
+        "post_import_preview_state": copy.deepcopy(pending_final_state),
+        "diff": deep_diff,
+        "conflicts": conflicts,
+        "rules_diff": rules_diff_info,
+        "age_info": age_info,
+        "blocked_reasons": {
+            "target_approved": pre_approved_blocked,
+            "target_newer": pre_target_newer_blocked,
+        },
+        "status": "pending_confirmation",
+        "confirmed": False,
+        "confirmed_at": None,
+        "confirmed_by": None,
+        "decisions_log": [],
+        "resumed_across_restart": False,
+    }
 
     if package.get("rules_snapshot") and args.apply_rules_snapshot:
         rules_dir = os.path.dirname(args.rules)
@@ -752,74 +1064,577 @@ def cmd_import_package(args, rules):
         with open(args.rules, "w", encoding="utf-8") as f:
             f.write(package["rules_snapshot"])
         print(f"[INFO] Rules snapshot restored to {args.rules}")
-        _audit(final_state, "rules_restored",
-               f"from_package={package_path} operator={operator}")
+        _audit(state_for_pending, "rules_restored_preview",
+               f"from_package={package_path} operator={operator} pending_takeover={pending_takeover_id}")
 
-    if mode == "takeover" and target_state_snapshot is not None:
-        deep_diff = _compute_deep_diff(target_state_snapshot, package_state)
-        takeover_snapshot = {
-            "takeover_id": hashlib.sha256(
-                f"{datetime.now().isoformat()}{operator}{package_path}".encode()
-            ).hexdigest()[:16],
-            "imported_at": datetime.now().isoformat(),
-            "imported_by": operator,
-            "import_pid": os.getpid(),
-            "exported_by": package.get("exported_by"),
-            "exported_at": package.get("exported_at"),
-            "package_path": os.path.basename(package_path),
-            "mode": mode,
-            "force": args.force,
-            "pre_import_state": target_state_snapshot,
-            "post_import_state": copy.deepcopy(final_state),
-            "diff": deep_diff,
-            "resumed_across_restart": False,
-        }
-        final_state.setdefault("takeover_history", []).append(takeover_snapshot)
-        _audit(final_state, "takeover_snapshot_stored",
-               f"takeover_id={takeover_snapshot['takeover_id']} "
-               f"operator={operator} mode={mode} "
-               f"modified_items={len(deep_diff['items']['modified'])} "
-               f"added_items={len(deep_diff['items']['added'])} "
-               f"removed_items={len(deep_diff['items']['removed'])}")
-    elif mode == "takeover" and target_state_snapshot is None:
-        takeover_snapshot = {
-            "takeover_id": hashlib.sha256(
-                f"{datetime.now().isoformat()}{operator}{package_path}".encode()
-            ).hexdigest()[:16],
-            "imported_at": datetime.now().isoformat(),
-            "imported_by": operator,
-            "import_pid": os.getpid(),
-            "exported_by": package.get("exported_by"),
-            "exported_at": package.get("exported_at"),
-            "package_path": os.path.basename(package_path),
-            "mode": mode,
-            "force": args.force,
-            "pre_import_state": None,
-            "post_import_state": copy.deepcopy(final_state),
-            "diff": None,
-            "note": "fresh_import_no_target_state",
-            "resumed_across_restart": False,
-        }
-        final_state.setdefault("takeover_history", []).append(takeover_snapshot)
+    _audit(state_for_pending, "import_package_reconciled",
+           f"takeover_id={pending_takeover_id} operator={operator} package={package_path} "
+           f"exported_by={package.get('exported_by')} mode={mode} "
+           f"conflicts={len(conflicts)} status=pending_confirmation")
+
+    save_state(state_for_pending, state_path)
+
+    print()
+    print(f"{'=' * 70}")
+    if pre_approved_blocked or pre_target_newer_blocked:
+        print(f"[STATUS] RECONCILED - BUT BLOCKED (need --force in confirm step)")
+    else:
+        print(f"[STATUS] RECONCILED - AWAITING CONFIRMATION")
+    print(f"{'=' * 70}")
+    print(f"  Takeover ID:      {pending_takeover_id}")
+    print(f"  State file written with pending_takeover (read-only, not committed).")
+    print()
+    print(f"  Next steps:")
+    print(f"    1. View details:   release_cli.py --state {state_path} takeover_detail")
+    print(f"    2. Confirm takeover: release_cli.py --state {state_path} takeover_confirm")
+    force_flag = " --force" if (pre_approved_blocked or pre_target_newer_blocked) else ""
+    print(f"       (add{force_flag} to override blocks)")
+    print(f"    3. Reconcile again: release_cli.py --state {state_path} import_package {package_path} --mode {mode}")
+    print(f"    4. Abort / cancel:  release_cli.py --state {state_path} takeover_revoke")
+    print(f"{'=' * 70}")
+    print()
+
+
+def cmd_takeover_detail(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    state.setdefault("takeover_history", [])
+    state.setdefault("confirmed_takeover_sessions", {})
+
+    takeover_id = getattr(args, "takeover_id", None)
+    pending = state.get("pending_takeover")
+    target_takeover = None
+    is_pending = False
+
+    if pending and (takeover_id is None or pending.get("takeover_id") == takeover_id):
+        target_takeover = pending
+        is_pending = True
+    elif takeover_id:
+        for tk in state.get("takeover_history", []):
+            if tk.get("takeover_id") == takeover_id:
+                target_takeover = tk
+                break
+        if target_takeover is None:
+            sess = state.get("confirmed_takeover_sessions", {}).get(takeover_id)
+            if sess:
+                target_takeover = sess
+    elif state.get("takeover_history"):
+        target_takeover = state["takeover_history"][-1]
+
+    if target_takeover is None:
+        print("[INFO] No takeover record found (no pending_takeover, no takeover_history).")
+        print("  Run 'import_package' first.")
+        return
+
+    tid = target_takeover.get("takeover_id", "?")
+    print(f"\n{'=' * 70}")
+    tag = " [PENDING CONFIRMATION]" if is_pending else ""
+    if target_takeover.get("confirmed") or target_takeover.get("confirmed_at"):
+        tag = " [CONFIRMED / PERSISTED]"
+    print(f"TAKEOVER DETAIL: {tid}{tag}")
+    print(f"{'=' * 70}")
+
+    print(f"\n[Basic Info]")
+    print(f"  Takeover ID:      {tid}")
+    print(f"  Imported at:      {target_takeover.get('imported_at')}")
+    print(f"  Imported by:      {target_takeover.get('imported_by')}")
+    print(f"  Exported by:      {target_takeover.get('exported_by')}")
+    print(f"  Exported at:      {target_takeover.get('exported_at')}")
+    print(f"  Package:          {target_takeover.get('package_path')}")
+    print(f"  Mode:             {target_takeover.get('mode')}")
+    print(f"  Force:            {target_takeover.get('force', False)}")
+    print(f"  Package checksum: {target_takeover.get('package_checksum', '(legacy)')}")
+
+    if target_takeover.get("confirmed_at"):
+        print(f"\n[Confirmation]")
+        print(f"  Confirmed at:     {target_takeover.get('confirmed_at')}")
+        print(f"  Confirmed by:     {target_takeover.get('confirmed_by')}")
+
+    pre = target_takeover.get("pre_import_state")
+    post = target_takeover.get("post_import_state") or target_takeover.get("post_import_preview_state")
+    if pre and post:
+        print(f"\n[State Transition]")
+        print(f"  Before: v{pre.get('version')} / draft v{pre.get('draft_version', 0)} / approved={pre.get('approved', False)}")
+        print(f"  After:  v{post.get('version')} / draft v{post.get('draft_version', 0)} / approved={post.get('approved', False)}")
+
+    blocked = target_takeover.get("blocked_reasons", {})
+    if blocked.get("target_approved") or blocked.get("target_newer"):
+        print(f"\n[Blocks Requiring --force During Confirm]")
+        if blocked.get("target_approved"):
+            print(f"  - Target state was already APPROVED at reconcile time")
+        if blocked.get("target_newer"):
+            print(f"  - Target state was NEWER than package state at reconcile time")
+
+    conflicts = target_takeover.get("conflicts", [])
+    if conflicts:
+        print(f"\n[Conflicts Detected] ({len(conflicts)})")
+        for i, c in enumerate(conflicts, 1):
+            sev_tag = {
+                "high": "[HIGH]",
+                "medium": "[MED]",
+                "low": "[LOW]",
+            }.get(c.get("severity", "medium"), "[MED]")
+            print(f"  {i}. {sev_tag} {c['type']}")
+            print(f"     {c['message']}")
+            opts = c.get("resolution_options", [])
+            if opts:
+                print(f"     Options: {', '.join(opts)}")
+
+    decisions = target_takeover.get("decisions_log", [])
+    if decisions:
+        print(f"\n[Conflict Decisions Applied]")
+        for d in decisions:
+            print(f"  [{d.get('ts')}] {d.get('conflict_type')}: {d.get('decision')}"
+                  f" - {d.get('detail', '')}")
+
+    summary = target_takeover.get("handover_summary")
+    if summary:
+        print(f"\n[Handover Summary (from source)]")
+        print(f"  Approval:         {summary.get('approval_status')}")
+        print(f"  Draft version:    v{summary.get('draft_version')}")
+        print(f"  Sections done:    {summary.get('sections_confirmed')}")
+        print(f"  Sections pending: {summary.get('sections_pending')}")
+        missing_owners = summary.get('items_with_missing_owner', [])
+        invalid_risks = summary.get('items_with_invalid_risk', [])
+        print(f"  Items:            {summary.get('items_total')} total"
+              f" ({len(missing_owners)} missing owner, {len(invalid_risks)} invalid risk)")
+        mig_pending = summary.get('migrations_pending', [])
+        print(f"  Migrations:       {summary.get('migration_total')} total"
+              f" ({len(mig_pending)} pending)")
+        print(f"  Known issues:     {summary.get('known_issues_total')}"
+              f" (reviewed={summary.get('known_issues_reviewed')})")
+        bulk_pending = summary.get('unresolved_bulk_ops', [])
+        if bulk_pending:
+            print(f"  Unresolved bulk:  indices {bulk_pending}")
+        next_steps = summary.get('suggested_next_steps', [])
+        if next_steps:
+            print(f"\n  Suggested next steps:")
+            for s in next_steps:
+                print(f"    - {s}")
+
+    diff = target_takeover.get("diff")
+    if diff and target_takeover.get("mode") == "takeover":
+        print(f"\n[Takeover Diff Detail]")
+        items_mod = diff["items"]["modified"]
+        items_add = diff["items"]["added"]
+        items_rem = diff["items"]["removed"]
+        if items_add:
+            print(f"  + ADDED ({len(items_add)} items):")
+            for item in items_add[:5]:
+                print(f"    - {item['id']}: {item['item'].get('title', '')}")
+            if len(items_add) > 5:
+                print(f"    ... and {len(items_add) - 5} more")
+        if items_rem:
+            print(f"  - REMOVED ({len(items_rem)} items):")
+            for item in items_rem[:5]:
+                print(f"    - {item['id']}: {item['item'].get('title', '')}")
+            if len(items_rem) > 5:
+                print(f"    ... and {len(items_rem) - 5} more")
+        if items_mod:
+            print(f"  ~ MODIFIED ({len(items_mod)} items):")
+            for item in items_mod[:10]:
+                print(f"    - {item['id']}:")
+                for d in item["diffs"]:
+                    old_repr = str(d["old"])[:30]
+                    new_repr = str(d["new"])[:30]
+                    print(f"      {d['field']}: {old_repr!r} -> {new_repr!r}")
+            if len(items_mod) > 10:
+                print(f"    ... and {len(items_mod) - 10} more modified items")
+
+    rules_diff = target_takeover.get("rules_diff")
+    if rules_diff and rules_diff.get("has_rules_snapshot"):
+        print(f"\n[Rules Status]")
+        if rules_diff.get("local_rules_missing"):
+            print(f"  Local rules MISSING (package has snapshot)")
+        elif rules_diff.get("identical"):
+            print(f"  Local rules IDENTICAL to package snapshot")
+        else:
+            add_cnt = len(rules_diff.get("added", []))
+            rem_cnt = len(rules_diff.get("removed", []))
+            print(f"  Rules differ: +{add_cnt}/-{rem_cnt} lines from package snapshot")
+            added = rules_diff.get("added", [])
+            removed = rules_diff.get("removed", [])
+            if added[:3]:
+                print(f"  In package, not in local:")
+                for ln, line in added[:3]:
+                    print(f"    + L{ln}: {line.strip()[:60]}")
+            if removed[:3]:
+                print(f"  In local, not in package:")
+                for ln, line in removed[:3]:
+                    print(f"    - L{ln}: {line.strip()[:60]}")
+
+    if target_takeover.get("resumed_across_restart"):
+        print(f"\n[Cross-Restart]")
+        print(f"  This session has been RESUMED after a process restart.")
+
+    print(f"\n{'=' * 70}")
+    if is_pending:
+        print(f"STATUS: PENDING CONFIRMATION")
+        print(f"  Confirm:  release_cli.py --state {state_path} takeover_confirm{force_flag_for(state)}")
+        print(f"  Revoke:   release_cli.py --state {state_path} takeover_revoke")
+    else:
+        print(f"STATUS: CONFIRMED (persisted in takeover_history and confirmed_takeover_sessions)")
+    print(f"{'=' * 70}")
+    print()
+
+
+def force_flag_for(state):
+    pending = state.get("pending_takeover")
+    if not pending:
+        return ""
+    blocked = pending.get("blocked_reasons", {})
+    if blocked.get("target_approved") or blocked.get("target_newer"):
+        return " --force"
+    return ""
+
+
+def cmd_takeover_confirm(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    state.setdefault("takeover_history", [])
+    state.setdefault("confirmed_takeover_sessions", {})
+
+    pending = state.get("pending_takeover")
+    if not pending:
+        print("[ERROR] No pending takeover found.")
+        print("  Run 'import_package' first to reconcile and create pending_takeover.")
+        sys.exit(1)
+
+    takeover_id = pending.get("takeover_id", "?")
+    operator = getattr(args, "operator", None) or _get_identity()
+
+    package_path = pending.get("package_path_full") or pending.get("package_path")
+    package = None
+    if package_path and os.path.exists(package_path):
+        try:
+            with open(package_path, "r", encoding="utf-8") as f:
+                package = json.load(f)
+        except Exception:
+            package = None
+
+    existing_pkg_info = {
+        "package_checksum": pending.get("package_checksum"),
+        "exported_at": pending.get("exported_at"),
+    }
+    if package:
+        fresh_conflicts = _detect_takeover_conflicts(
+            pending.get("pre_import_state"), package, args.rules, existing_pkg_info
+        )
+        prior_types = {c.get("type") for c in pending.get("conflicts", [])}
+        new_conflicts = [c for c in fresh_conflicts if c.get("type") not in prior_types]
+    else:
+        new_conflicts = []
+
+    if new_conflicts:
+        print(f"[WARNING] New conflicts since reconcile ({len(new_conflicts)}):")
+        for c in new_conflicts:
+            print(f"  - {c['type']}: {c['message']}")
+        pending.setdefault("conflicts", []).extend(new_conflicts)
+
+    blocked = pending.get("blocked_reasons", {})
+    has_blocks = blocked.get("target_approved") or blocked.get("target_newer")
+    if has_blocks and not getattr(args, "force", False):
+        print(f"[BLOCKED] Cannot confirm without --force:")
+        if blocked.get("target_approved"):
+            print(f"  - Target state was already APPROVED at reconcile time")
+        if blocked.get("target_newer"):
+            print(f"  - Target state was NEWER than package state at reconcile time")
+        print(f"  Re-run with --force to confirm anyway, or use takeover_revoke to cancel.")
+        if pending.get("conflicts"):
+            print(f"  Also, there are {len(pending['conflicts'])} unresolved conflicts; "
+                  f"see takeover_detail for list. They will be marked override.")
+        sys.exit(1)
+
+    decision_mode = getattr(args, "decision", "override_all")
+    per_item_raw = getattr(args, "per_item", None)
+    per_item_decision = {}
+    if per_item_raw:
+        for pair in per_item_raw.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                per_item_decision[k.strip()] = v.strip()
+
+    decisions_log = pending.setdefault("decisions_log", [])
+    ts_now = datetime.now().isoformat()
+
+    for conflict in pending.get("conflicts", []):
+        ctype = conflict.get("type")
+        per_key = f"conflict:{ctype}"
+        if per_key in per_item_decision:
+            dec = per_item_decision[per_key]
+        elif decision_mode == "override_all":
+            dec = "override"
+        elif decision_mode == "skip_all":
+            dec = "skip"
+        else:
+            dec = "override"
+
+        opts = conflict.get("resolution_options", ["override"])
+        if dec not in opts and "override" in opts:
+            dec = "override"
+        decisions_log.append({
+            "ts": ts_now,
+            "conflict_type": ctype,
+            "decision": dec,
+            "operator": operator,
+            "detail": f"conflict={ctype} decision={dec} mode={decision_mode}",
+        })
+
+    mode = pending.get("mode", "takeover")
+    pre_import_state = pending.get("pre_import_state")
+    post_import_state = pending.get("post_import_preview_state")
+
+    if post_import_state is None:
+        print("[ERROR] pending_takeover missing post_import_preview_state.")
+        sys.exit(1)
+
+    final_state = copy.deepcopy(post_import_state)
+    final_state.setdefault("takeover_history", [])
+    final_state.setdefault("confirmed_takeover_sessions", {})
+    final_state.setdefault("audit_log", [])
+
+    if mode == "takeover":
+        _audit(final_state, "import_package_takeover",
+               f"operator={operator} takeover_id={takeover_id} "
+               f"package={pending.get('package_path')} "
+               f"exported_by={pending.get('exported_by')} "
+               f"exported_at={pending.get('exported_at')} "
+               f"force={getattr(args, 'force', False)} "
+               f"decisions={len(decisions_log)} conflicts={len(pending.get('conflicts', []))}")
+    else:
+        _audit(final_state, "import_package_merge",
+               f"operator={operator} takeover_id={takeover_id} "
+               f"package={pending.get('package_path')} "
+               f"exported_by={pending.get('exported_by')} "
+               f"exported_at={pending.get('exported_at')} "
+               f"decisions={len(decisions_log)} conflicts={len(pending.get('conflicts', []))}")
+
+    deep_diff = pending.get("diff")
+    confirmed_at = datetime.now().isoformat()
+    takeover_record = {
+        "takeover_id": takeover_id,
+        "imported_at": pending.get("imported_at"),
+        "imported_by": pending.get("imported_by"),
+        "import_pid": pending.get("import_pid"),
+        "exported_by": pending.get("exported_by"),
+        "exported_at": pending.get("exported_at"),
+        "package_path": pending.get("package_path"),
+        "package_checksum": pending.get("package_checksum"),
+        "package_format_version": pending.get("package_format_version"),
+        "mode": mode,
+        "force": getattr(args, "force", False),
+        "pre_import_state": pre_import_state,
+        "post_import_state": copy.deepcopy(final_state),
+        "diff": deep_diff,
+        "handover_summary": pending.get("handover_summary"),
+        "conflicts": pending.get("conflicts", []),
+        "decisions_log": decisions_log,
+        "rules_diff": pending.get("rules_diff"),
+        "status": "confirmed",
+        "confirmed": True,
+        "confirmed_at": confirmed_at,
+        "confirmed_by": operator,
+        "resumed_across_restart": False,
+    }
+    final_state["takeover_history"].append(takeover_record)
+
+    final_state["confirmed_takeover_sessions"][takeover_id] = {
+        "takeover_id": takeover_id,
+        "imported_at": pending.get("imported_at"),
+        "imported_by": pending.get("imported_by"),
+        "confirmed_at": confirmed_at,
+        "confirmed_by": operator,
+        "session_pid": os.getpid(),
+        "session_created_at": datetime.now().isoformat(),
+        "mode": mode,
+        "package_path": pending.get("package_path"),
+        "package_checksum": pending.get("package_checksum"),
+        "decisions_log": decisions_log,
+        "handover_summary": pending.get("handover_summary"),
+        "revoked": False,
+        "revoked_at": None,
+        "revoked_by": None,
+        "revoke_reason": None,
+        "resumed_across_restart": False,
+        "resumed_count": 0,
+    }
+
+    _audit(final_state, "takeover_confirmed",
+           f"takeover_id={takeover_id} operator={operator} mode={mode} "
+           f"decisions={len(decisions_log)} conflicts={len(pending.get('conflicts', []))} "
+           f"force={getattr(args, 'force', False)}")
+
+    if package and package.get("rules_snapshot") and pending.get("apply_rules_snapshot"):
+        rules_dir = os.path.dirname(args.rules)
+        if not os.path.exists(rules_dir):
+            os.makedirs(rules_dir, exist_ok=True)
+        with open(args.rules, "w", encoding="utf-8") as f:
+            f.write(package["rules_snapshot"])
+        _audit(final_state, "rules_restored",
+               f"from_package={pending.get('package_path')} operator={operator} "
+               f"takeover_id={takeover_id}")
+
+    final_state["pending_takeover"] = None
 
     save_state(final_state, state_path)
 
+    print(f"\n{'=' * 70}")
+    print(f"TAKEOVER CONFIRMED AND PERSISTED")
+    print(f"{'=' * 70}")
+    print(f"  Takeover ID:      {takeover_id}")
+    print(f"  Confirmed at:     {confirmed_at}")
+    print(f"  Confirmed by:     {operator}")
+    print(f"  Mode:             {mode}")
+    print(f"  Conflicts resolved: {len(pending.get('conflicts', []))}")
+    if decisions_log:
+        print(f"  Decisions applied:  {len(decisions_log)}")
+    print(f"  Final state:      v{final_state.get('version')} / draft v{final_state.get('draft_version', 0)}")
+    print(f"  Items:            {len(final_state.get('items', []))}")
+    print(f"  Audit log:        {len(final_state.get('audit_log', []))} entries")
     print()
-    print(f"[OK] Package imported successfully (mode={mode}).")
-    print(f"   Final state:  v{final_state.get('version')} / draft v{final_state.get('draft_version')}")
-    print(f"   Items:        {len(final_state.get('items', []))}")
-    print(f"   Audit log:    {len(final_state.get('audit_log', []))} entries")
-    if final_state.get("pending_bulk_ops"):
-        unresolved = len([p for p in final_state["pending_bulk_ops"] if not p.get("resolved")])
-        print(f"   Pending bulk: {unresolved} unresolved / {len(final_state['pending_bulk_ops'])} total")
+    print(f"  Session is now PERSISTED (cross-restart safe).")
+    print(f"  Entry added to takeover_history and confirmed_takeover_sessions.")
     print()
-    print(f"   Next steps:")
+    print(f"  Next steps:")
     print(f"     release_cli.py --state {state_path} status")
-    print(f"     release_cli.py --state {state_path} history")
+    print(f"     release_cli.py --state {state_path} audit_view")
     if final_state.get("pending_bulk_ops"):
         unresolved_indices = [i for i, p in enumerate(final_state["pending_bulk_ops"]) if not p.get("resolved")]
         for idx in unresolved_indices:
             print(f"     release_cli.py --state {state_path} bulk_amend --resume {idx} --decision overwrite")
+    summary = pending.get("handover_summary") or {}
+    next_steps = summary.get("suggested_next_steps", [])
+    if next_steps:
+        print(f"  From handover summary:")
+        for s in next_steps:
+            print(f"    - {s}")
+    print(f"{'=' * 70}")
+    print()
+
+
+def cmd_takeover_revoke(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    state.setdefault("takeover_history", [])
+    state.setdefault("confirmed_takeover_sessions", {})
+
+    takeover_id = getattr(args, "takeover_id", None)
+    reason = getattr(args, "reason", "") or "manual revocation"
+    operator = getattr(args, "operator", None) or _get_identity()
+    force = getattr(args, "force", False)
+
+    pending = state.get("pending_takeover")
+    if pending and (takeover_id is None or pending.get("takeover_id") == takeover_id):
+        tid = pending.get("takeover_id", "?")
+        print(f"\n[Revoking PENDING TAKEOVER] {tid}")
+        print(f"  Reason: {reason}")
+
+        _audit(state, "takeover_revoked_pending",
+               f"takeover_id={tid} operator={operator} reason={reason}")
+
+        pre_import_state = pending.get("pre_import_state")
+        if pre_import_state is None:
+            state["pending_takeover"] = None
+            if not state.get("items") and not state.get("imported_batches"):
+                if os.path.exists(state_path):
+                    os.remove(state_path)
+                print(f"  Pending takeover removed. State file was fresh import - deleted.")
+            else:
+                state["pending_takeover"] = None
+                save_state(state, state_path)
+                print(f"  Pending takeover removed. Original state restored.")
+        else:
+            restored = copy.deepcopy(pre_import_state)
+            restored["takeover_history"] = state.get("takeover_history", [])
+            restored["confirmed_takeover_sessions"] = state.get("confirmed_takeover_sessions", {})
+            restored["audit_log"] = state.get("audit_log", [])
+            restored["pending_takeover"] = None
+            _audit(restored, "takeover_revoked_pending_restore",
+                   f"takeover_id={tid} operator={operator} reason={reason}")
+            save_state(restored, state_path)
+            print(f"  Pending takeover removed. Pre-import state restored.")
+
+        print(f"[OK] Pending takeover {tid} revoked successfully.")
+        print()
+        return
+
+    target_id = takeover_id
+    if target_id is None:
+        sess_ids = list(state.get("confirmed_takeover_sessions", {}).keys())
+        if not sess_ids:
+            print("[ERROR] No pending_takeover and no confirmed_takeover_sessions to revoke.")
+            sys.exit(1)
+        target_id = sess_ids[-1]
+
+    sess = state.get("confirmed_takeover_sessions", {}).get(target_id)
+    if not sess:
+        print(f"[ERROR] Confirmed session for takeover_id={target_id} not found.")
+        sys.exit(1)
+
+    if not force:
+        print(f"[WARNING] You are revoking a CONFIRMED (persisted) takeover session.")
+        print(f"  Takeover ID: {target_id}")
+        print(f"  Confirmed at: {sess.get('confirmed_at')}")
+        print(f"  Confirmed by: {sess.get('confirmed_by')}")
+        print(f"  This will rollback state to pre-import snapshot (if available).")
+        print(f"  Re-run with --force to proceed, or --takeover_id to pick another.")
+        sys.exit(1)
+
+    tk_record = None
+    for tk in state.get("takeover_history", []):
+        if tk.get("takeover_id") == target_id:
+            tk_record = tk
+            break
+
+    tid = target_id
+    print(f"\n[Revoking CONFIRMED TAKEOVER SESSION] {tid}")
+    print(f"  Reason: {reason}")
+    print(f"  Force:  yes")
+
+    ts_now = datetime.now().isoformat()
+    sess["revoked"] = True
+    sess["revoked_at"] = ts_now
+    sess["revoked_by"] = operator
+    sess["revoke_reason"] = reason
+
+    if tk_record:
+        tk_record["revoked"] = True
+        tk_record["revoked_at"] = ts_now
+        tk_record["revoked_by"] = operator
+        tk_record["revoke_reason"] = reason
+
+    _audit(state, "takeover_revoked_confirmed",
+           f"takeover_id={tid} operator={operator} reason={reason}")
+
+    pre_import = tk_record.get("pre_import_state") if tk_record else None
+    if pre_import is not None:
+        restored = copy.deepcopy(pre_import)
+        restored["takeover_history"] = state.get("takeover_history", [])
+        restored["confirmed_takeover_sessions"] = state.get("confirmed_takeover_sessions", {})
+        restored["audit_log"] = state.get("audit_log", [])
+        restored["pending_takeover"] = None
+        _audit(restored, "takeover_revoked_confirmed_rollback",
+               f"takeover_id={tid} operator={operator} reason={reason}")
+        save_state(restored, state_path)
+        print(f"  State rolled back to pre-import snapshot.")
+    else:
+        save_state(state, state_path)
+        print(f"  Session marked revoked. (No pre-import snapshot available for rollback)")
+
+    print(f"[OK] Confirmed takeover {tid} revoked successfully.")
+    print()
 
 
 def _ensure_item_versioning(item, operator="system"):
@@ -1358,6 +2173,47 @@ def cmd_status(args, rules):
     print(f"Draft history: {len(state.get('drafts', []))} draft(s)")
     print(f"Audit entries:  {len(state.get('audit_log', []))}")
 
+    pending = state.get("pending_takeover")
+    if pending:
+        print()
+        print(f"{'=' * 60}")
+        print(f"[TAKEOVER: PENDING CONFIRMATION]")
+        print(f"  Takeover ID:      {pending.get('takeover_id', '?')}")
+        print(f"  Imported at:      {pending.get('imported_at')}")
+        print(f"  Imported by:      {pending.get('imported_by')}")
+        print(f"  Exported by:      {pending.get('exported_by')}")
+        print(f"  Mode:             {pending.get('mode')}")
+        print(f"  Package:          {pending.get('package_path')}")
+        conflicts = pending.get("conflicts", [])
+        if conflicts:
+            print(f"  Conflicts:        {len(conflicts)} detected (run takeover_detail for list)")
+        blocked = pending.get("blocked_reasons", {})
+        if blocked.get("target_approved") or blocked.get("target_newer"):
+            print(f"  BLOCKS:           need --force during takeover_confirm")
+        summary = pending.get("handover_summary") or {}
+        if summary.get("suggested_next_steps"):
+            print(f"  Suggested next:   {summary['suggested_next_steps'][0]}")
+        print(f"  Next:             takeover_detail -> takeover_confirm{force_flag_for(state)} | takeover_revoke")
+        print(f"{'=' * 60}")
+
+    sessions = state.get("confirmed_takeover_sessions", {})
+    active_sessions = [s for s in sessions.values() if not s.get("revoked")]
+    if active_sessions:
+        print()
+        print(f"[Active Takeover Sessions: {len(active_sessions)}]")
+        for s in active_sessions:
+            resumed_tag = " [RESUMED]" if s.get("resumed_across_restart") else ""
+            print(f"  - {s.get('takeover_id')} by {s.get('confirmed_by')} @ {s.get('confirmed_at')}"
+                  f"{resumed_tag} (mode={s.get('mode')})")
+
+    tk_hist = state.get("takeover_history", [])
+    revoked = [t for t in tk_hist if t.get("revoked")]
+    if revoked:
+        print(f"[Revoked takeovers: {len(revoked)}]")
+        for t in revoked:
+            print(f"  - {t.get('takeover_id')} revoked by {t.get('revoked_by')} @ {t.get('revoked_at')}"
+                  f" reason={t.get('revoke_reason','')[:40]}")
+
 
 def cmd_history(args, rules):
     state_path = args.state
@@ -1385,32 +2241,69 @@ def cmd_audit_view(args, rules):
         print("[INFO] No state found.")
         return
 
+    state.setdefault("takeover_history", [])
+    state.setdefault("confirmed_takeover_sessions", {})
     takeover_history = state.get("takeover_history", [])
-    if not takeover_history:
+    sessions = state.get("confirmed_takeover_sessions", {})
+
+    if not takeover_history and not state.get("pending_takeover"):
         print("[INFO] No takeover history found.")
-        print("  (This state was never imported via import_package mode=takeover)")
+        print("  (This state was never imported via import_package)")
         return
 
     current_pid = os.getpid()
     state_updated = False
     audit_log = state.get("audit_log", [])
+    confirmed_action_whitelist = {
+        "takeover_snapshot_stored",
+        "import_package_reconciled",
+        "import_package_takeover",
+        "import_package_merge",
+        "takeover_confirmed",
+        "rules_restored",
+        "takeover_revoked_confirmed",
+        "takeover_revoked_confirmed_rollback",
+    }
     for takeover in takeover_history:
-        if not takeover.get("resumed_across_restart", False):
+        tid = takeover.get("takeover_id")
+        sess = sessions.get(tid, {})
+        if not takeover.get("resumed_across_restart", False) and not sess.get("resumed_across_restart", False):
             import_pid = takeover.get("import_pid")
-            if import_pid is not None and import_pid != current_pid:
-                imported_at = takeover.get("imported_at")
+            session_pid = sess.get("session_pid")
+            check_pid = session_pid if session_pid else import_pid
+            imported_at = takeover.get("imported_at") or sess.get("imported_at")
+            confirmed_at = takeover.get("confirmed_at") or sess.get("confirmed_at")
+            baseline_ts = confirmed_at if confirmed_at else imported_at
+            if check_pid is not None and check_pid != current_pid:
                 has_subsequent_work = False
                 for event in audit_log:
-                    if event.get("timestamp", "") > imported_at and \
-                       event.get("action") != "takeover_snapshot_stored":
+                    if event.get("timestamp", "") > (baseline_ts or "") and \
+                       event.get("action") not in confirmed_action_whitelist:
                         has_subsequent_work = True
                         break
                 if has_subsequent_work:
                     takeover["resumed_across_restart"] = True
+                    sess["resumed_across_restart"] = True
+                    sess["resumed_count"] = sess.get("resumed_count", 0) + 1
                     state_updated = True
                     _audit(state, "takeover_resumed_across_restart",
-                           f"takeover_id={takeover['takeover_id']} "
-                           f"import_pid={import_pid} current_pid={current_pid}")
+                           f"takeover_id={tid} import_pid={import_pid} "
+                           f"session_pid={session_pid} current_pid={current_pid}")
+
+    pending = state.get("pending_takeover")
+    if pending:
+        for event in audit_log:
+            if event.get("timestamp", "") > pending.get("imported_at", "") and \
+               event.get("action") not in ("import_package_reconciled",
+                                           "rules_restored_preview",
+                                           "takeover_detail"):
+                if not pending.get("resumed_across_restart"):
+                    pending["resumed_across_restart"] = True
+                    state_updated = True
+                    _audit(state, "pending_takeover_resumed_across_restart",
+                           f"takeover_id={pending.get('takeover_id')} current_pid={current_pid}")
+                break
+
     if state_updated:
         save_state(state, state_path)
 
@@ -1418,10 +2311,35 @@ def cmd_audit_view(args, rules):
     print("AUDIT VIEW - Takeover Timeline")
     print("=" * 70)
 
+    if pending:
+        tid = pending.get("takeover_id", "?")
+        print(f"\n{'─' * 70}")
+        print(f"[PENDING TAKEOVER] {tid}")
+        print(f"{'─' * 70}")
+        print(f"  Imported at:    {pending.get('imported_at')}")
+        print(f"  Imported by:    {pending.get('imported_by')}")
+        print(f"  Exported by:    {pending.get('exported_by')}")
+        print(f"  Exported at:    {pending.get('exported_at')}")
+        print(f"  Package:        {pending.get('package_path')}")
+        print(f"  Mode:           {pending.get('mode')}")
+        conflicts = pending.get("conflicts", [])
+        if conflicts:
+            print(f"  Conflicts:      {len(conflicts)} detected (use takeover_detail for list)")
+        blocked = pending.get("blocked_reasons", {})
+        if blocked.get("target_approved") or blocked.get("target_newer"):
+            print(f"  Status:         BLOCKED (needs --force in takeover_confirm)")
+        else:
+            print(f"  Status:         AWAITING CONFIRMATION")
+        if pending.get("resumed_across_restart"):
+            print(f"  Cross-restart:  YES (pending takeover survived restart)")
+
     for idx, takeover in enumerate(reversed(takeover_history)):
         tid = takeover.get("takeover_id", "?")
+        sess = sessions.get(tid, {})
+        revoked = takeover.get("revoked") or sess.get("revoked")
         print(f"\n{'─' * 70}")
-        print(f"Takeover #{len(takeover_history) - idx}: {tid}")
+        status_tag = " [REVOKED]" if revoked else ""
+        print(f"Takeover #{len(takeover_history) - idx}: {tid}{status_tag}")
         print(f"{'─' * 70}")
         print(f"  Imported at:    {takeover.get('imported_at')}")
         print(f"  Imported by:    {takeover.get('imported_by')}")
@@ -1432,6 +2350,25 @@ def cmd_audit_view(args, rules):
         print(f"  Force:          {takeover.get('force', False)}")
         if takeover.get('note'):
             print(f"  Note:           {takeover.get('note')}")
+
+        if takeover.get("confirmed_at"):
+            print(f"\n  [Confirmation]")
+            print(f"    Confirmed at: {takeover.get('confirmed_at')}")
+            print(f"    Confirmed by: {takeover.get('confirmed_by')}")
+
+        if sess and sess.get("session_created_at"):
+            print(f"\n  [Persistent Session]")
+            print(f"    Created at:   {sess.get('session_created_at')}")
+            print(f"    Session PID:  {sess.get('session_pid')}")
+            if sess.get('resumed_count', 0) > 0:
+                print(f"    Resumed cnt:  {sess.get('resumed_count')}")
+
+        if revoked:
+            print(f"\n  [Revocation]")
+            print(f"    Revoked at:   {takeover.get('revoked_at') or sess.get('revoked_at')}")
+            print(f"    Revoked by:   {takeover.get('revoked_by') or sess.get('revoked_by')}")
+            if takeover.get("revoke_reason") or sess.get("revoke_reason"):
+                print(f"    Reason:       {takeover.get('revoke_reason') or sess.get('revoke_reason')}")
 
         pre_state = takeover.get("pre_import_state")
         post_state = takeover.get("post_import_state")
@@ -1512,11 +2449,34 @@ def cmd_audit_view(args, rules):
             else:
                 print(f"    (no changes)")
 
+        conflicts = takeover.get("conflicts", [])
+        if conflicts:
+            print(f"\n  [Conflicts] ({len(conflicts)})")
+            for c in conflicts[:5]:
+                print(f"    - {c.get('type')}: {c.get('message','')[:60]}")
+            if len(conflicts) > 5:
+                print(f"    ... and {len(conflicts) - 5} more")
+
+        decisions = takeover.get("decisions_log", [])
+        if decisions:
+            print(f"\n  [Conflict Decisions] ({len(decisions)})")
+            for d in decisions[:5]:
+                print(f"    [{d.get('ts','')[:19]}] {d.get('conflict_type')}: "
+                      f"{d.get('decision')} by {d.get('operator','')}")
+            if len(decisions) > 5:
+                print(f"    ... and {len(decisions) - 5} more")
+
         print(f"\n  [Decisions]")
-        print(f"    Decision maker: {takeover.get('imported_by')}")
-        print(f"    Decision time:  {takeover.get('imported_at')}")
-        if takeover.get('resumed_across_restart'):
+        if takeover.get("confirmed_by"):
+            print(f"    Decision maker: {takeover.get('confirmed_by')} (confirmed)")
+            print(f"    Decision time:  {takeover.get('confirmed_at')}")
+        else:
+            print(f"    Decision maker: {takeover.get('imported_by')} (imported, legacy)")
+            print(f"    Decision time:  {takeover.get('imported_at')}")
+        if takeover.get('resumed_across_restart') or sess.get('resumed_across_restart'):
             print(f"    Cross-restart:  YES (resumed after process restart)")
+            if sess.get('resumed_count', 0) > 0:
+                print(f"    Resume count:   {sess.get('resumed_count')}")
         else:
             print(f"    Cross-restart:  NO (same process session)")
 
@@ -1534,12 +2494,33 @@ def cmd_audit_view(args, rules):
         })
 
     for takeover in takeover_history:
+        tk_ts = takeover.get("confirmed_at") or takeover.get("imported_at")
+        tk_action = "takeover_confirmed" if takeover.get("confirmed_at") else "import_package_takeover"
+        tk_by = takeover.get("confirmed_by") or takeover.get("imported_by")
         all_events.append({
-            "ts": takeover.get("imported_at"),
+            "ts": tk_ts,
             "type": "takeover",
-            "action": "import_package_takeover",
-            "detail": f"takeover_id={takeover.get('takeover_id')} by {takeover.get('imported_by')}",
+            "action": tk_action,
+            "detail": f"takeover_id={takeover.get('takeover_id')} by {tk_by}",
             "resumed": takeover.get("resumed_across_restart", False),
+            "revoked": takeover.get("revoked", False),
+        })
+        if takeover.get("revoked"):
+            all_events.append({
+                "ts": takeover.get("revoked_at"),
+                "type": "takeover",
+                "action": "takeover_revoked",
+                "detail": (f"takeover_id={takeover.get('takeover_id')} "
+                          f"by {takeover.get('revoked_by')} reason={takeover.get('revoke_reason','')[:40]}"),
+            })
+
+    if pending:
+        all_events.append({
+            "ts": pending.get("imported_at"),
+            "type": "takeover",
+            "action": "pending_takeover_reconciled",
+            "detail": f"takeover_id={pending.get('takeover_id')} by {pending.get('imported_by')}",
+            "pending": True,
         })
 
     all_events.sort(key=lambda x: x.get("ts", ""))
@@ -1547,7 +2528,14 @@ def cmd_audit_view(args, rules):
     print(f"  Total events: {len(all_events)}")
     print()
     for ev in all_events:
-        tag = "[TAKEOVER]" if ev["type"] == "takeover" else "[AUDIT]"
+        if ev.get("pending"):
+            tag = "[PENDING]"
+        elif ev.get("revoked"):
+            tag = "[REVOKED]"
+        elif ev["type"] == "takeover":
+            tag = "[TAKEOVER]"
+        else:
+            tag = "[AUDIT]"
         resumed_tag = " [RESUMED]" if ev.get("resumed") else ""
         print(f"  [{ev['ts']}] {tag}{resumed_tag} {ev['action']}: {ev['detail'][:80]}")
 
@@ -2409,6 +3397,28 @@ def main():
 
     p_audit_view = sub.add_parser("audit_view", help="Show audit timeline of takeovers - field changes, decision makers, cross-restart status")
 
+    p_tk_detail = sub.add_parser("takeover_detail", help="Show handover detail - reconcile summary, conflicts, handover_summary, diffs")
+    p_tk_detail.add_argument("--takeover-id", default=None, help="Specific takeover_id to view (default: latest pending or latest confirmed)")
+
+    p_tk_confirm = sub.add_parser("takeover_confirm", help="Confirm pending takeover and persist cross-restart session")
+    p_tk_confirm.add_argument("--operator", help="Operator identifier (for audit & decision log)")
+    p_tk_confirm.add_argument("--force", action="store_true",
+                              help="Force confirm even if blocked (target already approved or newer)")
+    p_tk_confirm.add_argument("--decision",
+                              choices=["override_all", "skip_all"],
+                              default="override_all",
+                              help="Default conflict resolution strategy")
+    p_tk_confirm.add_argument("--per-item", default=None, metavar="conflict:TYPE=DEC,...",
+                              help=("Per-conflict-type overrides "
+                                    "(e.g. conflict:rules_differs=skip,conflict:draft_version_mismatch=override)"))
+
+    p_tk_revoke = sub.add_parser("takeover_revoke", help="Revoke/undo a takeover (pending or confirmed)")
+    p_tk_revoke.add_argument("--takeover-id", default=None, help="Specific takeover_id to revoke (default: pending or latest confirmed)")
+    p_tk_revoke.add_argument("--reason", default="", help="Reason for revocation (written to audit log)")
+    p_tk_revoke.add_argument("--operator", help="Operator identifier (for audit)")
+    p_tk_revoke.add_argument("--force", action="store_true",
+                             help="Required to revoke a confirmed (persisted) takeover session")
+
     args = parser.parse_args()
     rules = load_rules(args.rules)
 
@@ -2428,6 +3438,9 @@ def main():
         "import_package": cmd_import_package,
         "preflight_check": cmd_preflight_check,
         "audit_view": cmd_audit_view,
+        "takeover_detail": cmd_takeover_detail,
+        "takeover_confirm": cmd_takeover_confirm,
+        "takeover_revoke": cmd_takeover_revoke,
     }
 
     fn = dispatch.get(args.command)
