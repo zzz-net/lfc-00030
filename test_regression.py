@@ -68,6 +68,18 @@ def assert_in(needle, haystack, msg):
         print(f"      in: {haystack[:200]!r}")
 
 
+def assert_not_in(needle, haystack, msg):
+    global FAIL, PASS
+    if needle not in haystack:
+        PASS += 1
+        print(f"    [ASSERT OK] {msg}")
+    else:
+        FAIL += 1
+        print(f"    [ASSERT FAIL] {msg}")
+        print(f"      unexpected: {needle!r}")
+        print(f"      in: {haystack[:200]!r}")
+
+
 def cleanup_patterns(workdir, state_filename=None):
     for fn in os.listdir(workdir):
         if fn.startswith("release_notes_") and fn.endswith(".md"):
@@ -1843,6 +1855,110 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
     cleanup_patterns(tmpdir, "state_machine2.json")
 
 
+def test_36_no_false_positive_cross_restart(tmpdir):
+    """跨重启续做识别：刚导入就看 audit 不应该误判为跨重启（反误报测试）"""
+    print("\n== Test 36: No false-positive cross-restart (just imported, no work done yet) ==")
+    sp_a = os.path.join(tmpdir, "state_t36_machineA.json")
+    sp_b = os.path.join(tmpdir, "state_t36_machineB.json")
+    cleanup_patterns(tmpdir, "state_t36_machineA.json")
+    cleanup_patterns(tmpdir, "state_t36_machineB.json")
+
+    print(f"\n  [Machine A] 导出交接包...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli(["draft"], sp_a)
+    run_cli(["amend", "CHG-001", "--field", "owner=张三"], sp_a)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_a)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp_a)
+    run_cli(["draft"], sp_a)
+    run_cli(["confirm", "overview"], sp_a)
+    run_cli(["confirm", "changes"], sp_a)
+
+    pkg = os.path.join(tmpdir, "handoff_pkg_t36.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "负责人A36",
+             "--description", "Q2-v2.1.0 交接包"], sp_a)
+
+    print(f"\n  [Machine B] 导入接管...")
+    run_cli(["import", SAMPLE], sp_b)
+    run_cli(["draft"], sp_b)
+    run_cli(["amend", "CHG-001", "--field", "owner=负责人B本地修改值"], sp_b)
+    run_cli(["import_package", pkg, "--operator", "负责人B36", "--mode", "takeover"], sp_b)
+
+    print(f"\n  [验证] 导入后立即看 audit_view（还没做任何后续工作）...")
+    s_after_import = read_state(sp_b)
+    assert_eq(len(s_after_import["takeover_history"]), 1, "t36: takeover history has 1 entry")
+    takeover_before = s_after_import["takeover_history"][0]
+    assert_eq(takeover_before["resumed_across_restart"], False,
+              "t36: right after import, resumed_across_restart should be False")
+
+    audit_events_before = len([e for e in s_after_import["audit_log"] 
+                               if e["action"] == "takeover_resumed_across_restart"])
+    assert_eq(audit_events_before, 0, "t36: no resume event before audit_view")
+
+    res_audit = run_cli(["audit_view"], sp_b)
+    assert_in("Cross-restart:  NO", res_audit.stdout, 
+              "t36: just imported, should show Cross-restart: NO (no false positive)")
+    assert_not_in("[RESUMED]", res_audit.stdout,
+                   "t36: just imported, should NOT have [RESUMED] tag")
+
+    s_after_audit = read_state(sp_b)
+    takeover_after = s_after_audit["takeover_history"][0]
+    assert_eq(takeover_after["resumed_across_restart"], False,
+              "t36: after first audit_view, resumed_across_restart still False")
+
+    audit_events_after = len([e for e in s_after_audit["audit_log"]
+                              if e["action"] == "takeover_resumed_across_restart"])
+    assert_eq(audit_events_after, 0, "t36: no resume event written for false-positive case")
+
+    print(f"\n  [OK] 刚导入就看 audit_view 不会误报跨重启，正确显示 Cross-restart: NO")
+
+    print(f"\n  [验证] 现在做后续工作（确认、批准、导出），再模拟重启看 audit_view...")
+    run_cli(["confirm", "migration"], sp_b)
+    run_cli(["confirm", "known_issues"], sp_b)
+    run_cli(["draft"], sp_b)
+    run_cli(["approve"], sp_b)
+
+    md_before = os.path.join(tmpdir, "t36_before_restart.md")
+    run_cli(["export", "-o", md_before], sp_b)
+
+    print(f"\n  [模拟重启] 新进程查看 audit_view...")
+    import subprocess
+    audit_script = os.path.join(tmpdir, "run_audit_t36.py")
+    with open(audit_script, "w", encoding="utf-8") as f:
+        f.write(f"""
+import sys
+sys.path.insert(0, r"{os.path.dirname(os.path.abspath(__file__))}")
+from release_cli import main as cli_main
+sys.argv = ["release_cli.py", "--state", r"{sp_b}", "audit_view"]
+cli_main()
+""")
+    result = subprocess.run(
+        [sys.executable, audit_script],
+        capture_output=True
+    )
+    audit_output = result.stdout.decode('utf-8', errors='ignore') + result.stderr.decode('utf-8', errors='ignore')
+
+    print(f"\n  [验证] 重启后 audit_view 输出...")
+    assert_in("Cross-restart:  YES", audit_output,
+              "t36: after real work + restart, should show Cross-restart: YES")
+    assert_in("[RESUMED]", audit_output,
+              "t36: after real work + restart, should have [RESUMED] tag")
+
+    s_final = read_state(sp_b)
+    takeover_final = s_final["takeover_history"][0]
+    assert_eq(takeover_final["resumed_across_restart"], True,
+              "t36: after real work + restart, resumed_across_restart is True")
+
+    audit_events_final = len([e for e in s_final["audit_log"]
+                              if e["action"] == "takeover_resumed_across_restart"])
+    assert_eq(audit_events_final, 1, "t36: exactly 1 resume event written")
+
+    print(f"\n  [OK] 做完后续工作 + 重启后，正确识别为跨重启续做")
+    print(f"\n  [OK] 反误报测试通过：刚导入不报，真实重启后才报")
+
+    cleanup_patterns(tmpdir, "state_t36_machineA.json")
+    cleanup_patterns(tmpdir, "state_t36_machineB.json")
+
+
 def test_35_cross_restart_resume_detection(tmpdir):
     """跨重启续做识别：完整链路验证，确保接管后重启能自动识别为跨进程续做"""
     print("\n== Test 35: Cross-restart resume detection (full E2E) ==")
@@ -2043,6 +2159,7 @@ def main():
         test_33_audit_view_timeline(tmpdir)
         test_34_full_e2e_preflight_import_restart(tmpdir)
         test_35_cross_restart_resume_detection(tmpdir)
+        test_36_no_false_positive_cross_restart(tmpdir)
 
         print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
         if FAIL:

@@ -1393,15 +1393,24 @@ def cmd_audit_view(args, rules):
 
     current_pid = os.getpid()
     state_updated = False
+    audit_log = state.get("audit_log", [])
     for takeover in takeover_history:
         if not takeover.get("resumed_across_restart", False):
             import_pid = takeover.get("import_pid")
             if import_pid is not None and import_pid != current_pid:
-                takeover["resumed_across_restart"] = True
-                state_updated = True
-                _audit(state, "takeover_resumed_across_restart",
-                       f"takeover_id={takeover['takeover_id']} "
-                       f"import_pid={import_pid} current_pid={current_pid}")
+                imported_at = takeover.get("imported_at")
+                has_subsequent_work = False
+                for event in audit_log:
+                    if event.get("timestamp", "") > imported_at and \
+                       event.get("action") != "takeover_snapshot_stored":
+                        has_subsequent_work = True
+                        break
+                if has_subsequent_work:
+                    takeover["resumed_across_restart"] = True
+                    state_updated = True
+                    _audit(state, "takeover_resumed_across_restart",
+                           f"takeover_id={takeover['takeover_id']} "
+                           f"import_pid={import_pid} current_pid={current_pid}")
     if state_updated:
         save_state(state, state_path)
 
