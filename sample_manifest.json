@@ -1,0 +1,68 @@
+{
+  "version": "2.1.0",
+  "batch_id": "batch-2026Q2-v2.1.0",
+  "items": [
+    {
+      "id": "CHG-001",
+      "title": "新增用户批量导入接口",
+      "owner": "张三",
+      "risk_level": "medium",
+      "category": "feature",
+      "description": "支持通过 CSV 文件批量导入用户，单次上限 5000 条。"
+    },
+    {
+      "id": "CHG-002",
+      "title": "修复订单金额精度丢失问题",
+      "owner": "李四",
+      "risk_level": "high",
+      "category": "bugfix",
+      "description": "订单金额计算改用 Decimal，修复浮点精度导致金额偏差。"
+    },
+    {
+      "id": "CHG-003",
+      "title": "下线旧版消息推送通道",
+      "owner": "",
+      "risk_level": "critical",
+      "category": "removal",
+      "description": "移除 MQTT 旧通道，所有推送迁移至 WebSocket 通道。"
+    },
+    {
+      "id": "CHG-004",
+      "title": "重构权限校验中间件",
+      "owner": "王五",
+      "risk_level": "medium",
+      "category": "refactor",
+      "description": "权限校验从装饰器模式改为中间件管道模式，提升可测试性。"
+    },
+    {
+      "id": "CHG-005",
+      "title": "升级依赖 openssl 至 3.x",
+      "owner": "赵六",
+      "risk_level": "extreme",
+      "category": "security",
+      "description": "修复 CVE-2026-XXXX，升级 openssl 到 3.x 版本。"
+    }
+  ],
+  "migration_reminders": [
+    {
+      "id": "MIG-001",
+      "title": "消息推送通道迁移",
+      "description": "请所有使用 MQTT 通道的客户端在发版前切换至 WebSocket 通道，旧通道将在 v2.1.0 下线。",
+      "action_required": "客户端升级至 SDK >= 1.8.0 并切换推送协议"
+    },
+    {
+      "id": "MIG-002",
+      "title": "批量导入模板格式变更",
+      "description": "CSV 模板新增 role 和 department 列，旧模板将无法使用。",
+      "action_required": "下载最新模板，补充 role 和 department 字段"
+    }
+  ],
+  "known_issues": [
+    {
+      "id": "KI-001",
+      "title": "Safari 浏览器批量导入进度条不刷新",
+      "description": "Safari 17 以下版本中，批量导入的进度条不会实时更新，但导入功能正常。",
+      "workaround": "使用 Chrome 或 Firefox，或刷新页面查看结果"
+    }
+  ]
+}

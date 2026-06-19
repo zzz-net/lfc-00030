@@ -1,0 +1,26 @@
+required_sections:
+  - overview
+  - changes
+  - migration
+  - known_issues
+
+valid_risk_levels:
+  - low
+  - medium
+  - high
+  - critical
+
+required_fields_per_item:
+  - id
+  - title
+  - owner
+  - risk_level
+  - category
+
+categories:
+  - feature
+  - bugfix
+  - refactor
+  - deprecation
+  - removal
+  - security

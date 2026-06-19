@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.next/
+.vite/
+coverage/
+
+# Env and local state
+.env
+.env.*
+*.log
+*.sqlite
+*.db
+*.tmp
+tmp/
+temp/
+
+# Release CLI state
+.release_state.json
+release_notes_*_draft*.md
+release_notes_*_final.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
