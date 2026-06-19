@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import csv
 import json
 import os
 import subprocess
@@ -394,6 +395,469 @@ def test_9_amend_restart_consistency(tmpdir):
     cleanup_patterns(tmpdir, "state_t9.json")
 
 
+def test_10_bulk_no_conflict_json_and_csv(tmpdir):
+    """无冲突场景：JSON 和 CSV 两种补丁格式都能正常批量修订"""
+    print("\n== Test 10: Bulk amend no-conflict (JSON & CSV) ==")
+    sp = os.path.join(tmpdir, "state_t10.json")
+    cleanup_patterns(tmpdir, "state_t10.json")
+
+    run_cli(["import", SAMPLE], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t10.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t10-json-001",
+            "operator": "产品经理A",
+            "reason": "Q2负责人回填+风险重评",
+            "items": [
+                {"id": "CHG-003", "owner": "周七", "risk_level": "high", "category": "removal"},
+                {"id": "CHG-005", "owner": "赵六", "risk_level": "critical", "category": "security"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "skip", "--operator", "产品经理A",
+                   "--reason", "Q2负责人回填+风险重评"], sp)
+    assert_in("Applied: 2", res.stdout, "json patch applied 2 items")
+    assert_in("Skipped: 0", res.stdout, "json patch skipped 0 items")
+
+    s = read_state(sp)
+    chg003 = next(it for it in s["items"] if it["id"] == "CHG-003")
+    assert_eq(chg003["owner"], "周七", "t10 CHG-003 owner updated via json bulk")
+    assert_eq(chg003["risk_level"], "high", "t10 CHG-003 risk_level updated via json bulk")
+    chg005 = next(it for it in s["items"] if it["id"] == "CHG-005")
+    assert_eq(chg005["risk_level"], "critical", "t10 CHG-005 risk_level updated via json bulk")
+    assert_eq(chg005["_last_modified_by"], "产品经理A", "t10 CHG-005 operator recorded in _last_modified_by")
+
+    bulk_events = [e for e in s["audit_log"] if e["action"] == "bulk_amend_applied"]
+    assert_eq(len(bulk_events), 1, "t10 audit has 1 bulk_amend_applied event")
+    assert_in("产品经理A", bulk_events[0]["detail"], "t10 audit records operator")
+
+    csv_patch = os.path.join(tmpdir, "patch_t10.csv")
+    with open(csv_patch, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "owner", "category"])
+        w.writerow(["CHG-001", "新张三A", "feature"])
+        w.writerow(["CHG-002", "新李四B", "bugfix"])
+
+    res2 = run_cli(["bulk_amend", csv_patch, "--mode", "skip", "--operator", "运营专员B"], sp)
+    assert_in("Applied: 2", res2.stdout, "csv patch applied 2 items")
+
+    s = read_state(sp)
+    chg001 = next(it for it in s["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "新张三A", "t10 CHG-001 owner updated via csv bulk")
+    chg002 = next(it for it in s["items"] if it["id"] == "CHG-002")
+    assert_eq(chg002["owner"], "新李四B", "t10 CHG-002 owner updated via csv bulk")
+    cleanup_patterns(tmpdir, "state_t10.json")
+
+
+def test_11_bulk_conflict_mode_abort(tmpdir):
+    """冲突场景：mode=abort 遇到冲突立即中止整个批次"""
+    print("\n== Test 11: Bulk amend conflict -> mode=abort ==")
+    sp = os.path.join(tmpdir, "state_t11.json")
+    cleanup_patterns(tmpdir, "state_t11.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+    run_cli(["confirm", "overview"], sp)
+    run_cli(["confirm", "changes"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t11.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t11-abort-001",
+            "operator": "tester11",
+            "items": [
+                {"id": "CHG-001", "owner": "变更A"},
+                {"id": "CHG-002", "owner": "变更B"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "abort", "--operator", "tester11"],
+                  sp, expect_fail=True)
+    assert_in("ABORT", res.stdout, "t11 mode=abort reports ABORT")
+
+    s = read_state(sp)
+    chg001 = next(it for it in s["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "张三", "t11 CHG-001 unchanged after abort")
+    events = [e for e in s["audit_log"] if e["action"] == "bulk_amend_aborted"]
+    assert_eq(len(events), 1, "t11 audit has bulk_amend_aborted event")
+    cleanup_patterns(tmpdir, "state_t11.json")
+
+
+def test_12_bulk_conflict_mode_skip(tmpdir):
+    """冲突场景：mode=skip 跳过冲突项，其余正常应用"""
+    print("\n== Test 12: Bulk amend conflict -> mode=skip ==")
+    sp = os.path.join(tmpdir, "state_t12.json")
+    cleanup_patterns(tmpdir, "state_t12.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["amend", "CHG-001", "--field", "owner=先改了", "--operator", "test12-prev"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t12.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t12-skip-001",
+            "operator": "tester12",
+            "items": [
+                {"id": "CHG-001", "owner": "冲突A"},
+                {"id": "CHG-003", "owner": "周七", "risk_level": "critical"},
+                {"id": "CHG-005", "risk_level": "high"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "skip", "--operator", "tester12"], sp)
+    assert_in("already modified by", res.stdout, "t12 reports already_modified conflict for CHG-001")
+
+    s = read_state(sp)
+    chg001 = next(it for it in s["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "先改了", "t12 CHG-001 (conflicted) unchanged")
+    chg003 = next(it for it in s["items"] if it["id"] == "CHG-003")
+    assert_eq(chg003["owner"], "周七", "t12 CHG-003 (no conflict) owner updated")
+    chg005 = next(it for it in s["items"] if it["id"] == "CHG-005")
+    assert_eq(chg005["risk_level"], "high", "t12 CHG-005 (no conflict) risk updated")
+    cleanup_patterns(tmpdir, "state_t12.json")
+
+
+def test_13_bulk_conflict_mode_overwrite(tmpdir):
+    """冲突场景：mode=overwrite 显式覆盖所有冲突"""
+    print("\n== Test 13: Bulk amend conflict -> mode=overwrite ==")
+    sp = os.path.join(tmpdir, "state_t13.json")
+    cleanup_patterns(tmpdir, "state_t13.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+    run_cli(["confirm", "overview"], sp)
+    run_cli(["confirm", "changes"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t13.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t13-ow-001",
+            "operator": "tester13",
+            "items": [
+                {"id": "CHG-001", "owner": "覆盖后的张三", "category": "feature"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "overwrite", "--operator", "tester13",
+                   "--reason", "强制覆盖纠正负责人"], sp)
+
+    s = read_state(sp)
+    chg001 = next(it for it in s["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "覆盖后的张三", "t13 CHG-001 force-overwrote conflicted field")
+    assert_eq(s["confirmations"]["changes"], False, "t13 changes section confirmation invalidated after overwrite")
+    assert_in("changes", res.stdout, "t13 reports invalidated sections")
+    bulk_ev = [e for e in s["audit_log"] if e["action"] == "bulk_amend_applied"]
+    assert_eq(len(bulk_ev), 1, "t13 audit records bulk_amend_applied for overwrite")
+    assert_in("强制覆盖纠正负责人", bulk_ev[0]["detail"], "t13 reason recorded in audit")
+    cleanup_patterns(tmpdir, "state_t13.json")
+
+
+def test_14_section_confirmed_detection(tmpdir):
+    """章节确认冲突：changes/migration/known_issues 已确认时的冲突检测"""
+    print("\n== Test 14: Section-confirmed conflict detection ==")
+    sp = os.path.join(tmpdir, "state_t14.json")
+    cleanup_patterns(tmpdir, "state_t14.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t14.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t14-sec-001",
+            "operator": "tester14",
+            "items": [{"id": "CHG-001", "owner": "X"}],
+            "migration_reminders": [{"id": "MIG-001", "title": "新标题A"}],
+            "known_issues": [{"id": "KI-001", "workaround": "新临时方案"}],
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "overwrite", "--operator", "tester14"], sp)
+
+    s = read_state(sp)
+    assert_eq(s["confirmations"]["changes"], False, "t14 changes invalidated after item patch")
+    assert_eq(s["confirmations"]["migration"], False, "t14 migration invalidated after mig patch")
+    assert_eq(s["confirmations"]["known_issues"], False, "t14 known_issues invalidated after ki patch")
+    assert_eq(s["known_issues_reviewed"], False, "t14 known_issues_reviewed reset")
+    mig001 = next(m for m in s["migration_reminders"] if m["id"] == "MIG-001")
+    assert_eq(mig001["title"], "新标题A", "t14 MIG-001 title updated")
+    ki001 = next(k for k in s["known_issues"] if k["id"] == "KI-001")
+    assert_eq(ki001["workaround"], "新临时方案", "t14 KI-001 workaround updated")
+    cleanup_patterns(tmpdir, "state_t14.json")
+
+
+def test_15_already_modified_conflict(tmpdir):
+    """already_modified 冲突：条目已被单独 amend 修改过"""
+    print("\n== Test 15: already_modified conflict (item previously amended) ==")
+    sp = os.path.join(tmpdir, "state_t15.json")
+    cleanup_patterns(tmpdir, "state_t15.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["amend", "CHG-001", "--field", "owner=先改的人", "--operator", "张三先改"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t15.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t15-am-001",
+            "operator": "后批量改的人",
+            "items": [
+                {"id": "CHG-001", "owner": "批量值"},
+                {"id": "CHG-002", "owner": "批量值B"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "skip"], sp)
+    assert_in("already modified by", res.stdout, "t15 reports already_modified conflict")
+
+    s = read_state(sp)
+    chg001 = next(it for it in s["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "先改的人", "t15 CHG-001 preserved (conflicted, skipped)")
+    chg002 = next(it for it in s["items"] if it["id"] == "CHG-002")
+    assert_eq(chg002["owner"], "批量值B", "t15 CHG-002 applied (no conflict)")
+    cleanup_patterns(tmpdir, "state_t15.json")
+
+
+def test_16_restart_conflict_resume(tmpdir):
+    """重启恢复冲突：interactive 模式下冲突持久化，重启后 resume 决策"""
+    print("\n== Test 16: Restart conflict persistence + resume ==")
+    sp = os.path.join(tmpdir, "state_t16.json")
+    cleanup_patterns(tmpdir, "state_t16.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+    run_cli(["confirm", "changes"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t16.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t16-resume-001",
+            "operator": "先发起者",
+            "items": [
+                {"id": "CHG-001", "owner": "批值A"},
+                {"id": "CHG-002", "owner": "批值B"},
+                {"id": "CHG-999", "owner": "不存在"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res1 = run_cli(["bulk_amend", json_patch, "--operator", "先发起者",
+                    "--reason", "待主管决定"], sp, expect_fail=True)
+    assert_in("Conflict info persisted", res1.stdout, "t16 interactive persists conflicts")
+    assert_in("--resume 0", res1.stdout, "t16 shows resume index 0")
+
+    s_before = read_state(sp)
+    pending = s_before.get("pending_bulk_ops", [])
+    assert_eq(len(pending), 1, "t16 1 pending_bulk_ops entry persisted")
+    assert_eq(pending[0]["resolved"], False, "t16 pending entry is unresolved")
+    assert_eq(pending[0]["patch_snapshot"]["patch_id"], "t16-resume-001",
+              "t16 pending snapshot has patch_id")
+
+    chg001_before = next(it for it in s_before["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001_before["owner"], "张三", "t16 CHG-001 still unchanged before resume")
+
+    subprocess.run([sys.executable, "-c", "import gc; gc.collect()"], capture_output=True)
+
+    s_reload = read_state(sp)
+    pending2 = s_reload.get("pending_bulk_ops", [])
+    assert_eq(len(pending2), 1, "t16 pending_bulk_ops preserved across reload (restart)")
+    assert_eq(pending2[0]["resolved"], False, "t16 pending still unresolved after reload")
+
+    res_resume = run_cli(["bulk_amend", "--resume", "0", "--decision", "overwrite",
+                          "--operator", "主管决定", "--per-item", "CHG-002=skip"], sp)
+
+    s_after = read_state(sp)
+    chg001 = next(it for it in s_after["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "批值A", "t16 CHG-001 overwritten via default=overwrite")
+    chg002 = next(it for it in s_after["items"] if it["id"] == "CHG-002")
+    assert_eq(chg002["owner"], "李四", "t16 CHG-002 skipped via per-item override")
+
+    pending_after = s_after["pending_bulk_ops"]
+    assert_eq(pending_after[0]["resolved"], True, "t16 pending marked resolved after resume")
+    assert_eq(pending_after[0]["resolved_operator"], "主管决定",
+              "t16 resolved_operator recorded")
+    assert_in("final_decisions", pending_after[0], "t16 final_decisions stored")
+
+    bulk_events = [e for e in s_after["audit_log"] if e["action"] == "bulk_amend_applied"
+                   and "resumed=true" in e["detail"]]
+    assert_eq(len(bulk_events), 1, "t16 audit records resumed bulk apply")
+    cleanup_patterns(tmpdir, "state_t16.json")
+
+
+def test_17_full_e2e_bulk_workflow(tmpdir):
+    """完整端到端：导入→批量修订→重生draft→重新确认→批准→导出，验证最终结果"""
+    print("\n== Test 17: Full E2E bulk amend workflow ==")
+    sp = os.path.join(tmpdir, "state_t17.json")
+    cleanup_patterns(tmpdir, "state_t17.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+    run_cli(["draft"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t17.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t17-e2e-001",
+            "operator": "发布经理X",
+            "reason": "发布前统一回填owner/risk/category+补充迁移提醒",
+            "items": [
+                {"id": "CHG-003", "owner": "周七", "risk_level": "critical", "category": "removal"},
+                {"id": "CHG-005", "owner": "赵六", "risk_level": "critical", "category": "security"},
+                {"id": "CHG-002", "owner": "李四", "risk_level": "high", "category": "bugfix"},
+            ],
+            "migration_reminders": [
+                {"id": "MIG-002", "action_required": "下载模板v2并补充 role/department 两列"},
+            ],
+            "known_issues": [
+                {"id": "KI-001", "description": "Safari 17以下批量导入进度条不刷新（仅UI，不影响功能）"},
+            ],
+        }, f, ensure_ascii=False, indent=2)
+
+    res_bulk = run_cli(["bulk_amend", json_patch, "--mode", "overwrite",
+                        "--operator", "发布经理X", "--reason", "发布前统一回填"], sp)
+    assert_in("Applied: 4", res_bulk.stdout,
+              "t17 applied 4 entries (CHG-002 no_change auto-skipped, 2 other items+1 mig+1 ki=4)")
+    assert_in("No-op", res_bulk.stdout, "t17 reports no-change for CHG-002")
+    assert_in("invalidated", res_bulk.stdout, "t17 reports invalidated sections")
+
+    s = read_state(sp)
+    assert_eq(s["confirmations"]["changes"], False, "t17 changes confirmation invalidated")
+    assert_eq(s["confirmations"]["migration"], False, "t17 migration confirmation invalidated")
+    assert_eq(s["confirmations"]["known_issues"], False, "t17 known_issues confirmation invalidated")
+
+    run_cli(["draft"], sp)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+    run_cli(["draft"], sp)
+    run_cli(["approve"], sp)
+
+    s = read_state(sp)
+    assert_eq(s["approved"], True, "t17 approve succeeds after bulk amend + re-confirm")
+
+    export_out = os.path.join(tmpdir, "t17_final.md")
+    run_cli(["export", "-o", export_out], sp)
+    md = read_file(export_out)
+
+    assert_in("owner:周七", md, "t17 final md: CHG-003 amended owner=周七")
+    assert_in("owner:赵六", md, "t17 final md: CHG-005 amended owner=赵六")
+    assert_in("risk:critical", md, "t17 final md: critical risks present")
+    assert_in("下载模板v2并补充 role/department 两列", md, "t17 final md: updated migration reminder")
+    assert_in("Safari 17以下批量导入进度条不刷新", md, "t17 final md: updated known issue description")
+
+    bulk_applied = [e for e in s["audit_log"] if e["action"] == "bulk_amend_applied"]
+    assert_eq(len(bulk_applied), 1, "t17 audit has bulk_amend_applied")
+    assert_in("发布经理X", bulk_applied[0]["detail"], "t17 audit records operator")
+
+    status_res = run_cli(["status"], sp)
+    assert_in("Items:         5", status_res.stdout, "t17 status shows 5 items")
+    assert_in("Approved:      True", status_res.stdout, "t17 status shows approved=True")
+
+    hist_res = run_cli(["history"], sp)
+    assert_in("bulk_amend_applied", hist_res.stdout, "t17 history shows bulk event")
+    assert_in("import", hist_res.stdout, "t17 history shows import event")
+    assert_in("approved", hist_res.stdout, "t17 history shows approve event")
+    cleanup_patterns(tmpdir, "state_t17.json")
+
+
+def test_18_bulk_draft_newer_conflict(tmpdir):
+    """draft_newer 冲突：补丁基于旧版本生成，当前 draft 已更新"""
+    print("\n== Test 18: draft_newer conflict detection ==")
+    sp = os.path.join(tmpdir, "state_t18.json")
+    cleanup_patterns(tmpdir, "state_t18.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t18.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t18-dn-001",
+            "operator": "tester18",
+            "based_on_draft_version": 0,
+            "items": [
+                {"id": "CHG-001", "owner": "基于旧草稿的值"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "skip", "--operator", "tester18"], sp)
+    assert_in("draft_newer", res.stdout or "", "t18 reports draft_newer conflict")
+
+    s = read_state(sp)
+    chg001 = next(it for it in s["items"] if it["id"] == "CHG-001")
+    assert_eq(chg001["owner"], "张三", "t18 CHG-001 preserved (draft_newer skipped)")
+    cleanup_patterns(tmpdir, "state_t18.json")
+
+
+def test_19_bulk_invalid_risk_rejected(tmpdir):
+    """补丁风险级别非法时整体拒绝"""
+    print("\n== Test 19: Bulk amend invalid risk validation ==")
+    sp = os.path.join(tmpdir, "state_t19.json")
+    cleanup_patterns(tmpdir, "state_t19.json")
+
+    run_cli(["import", SAMPLE], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t19.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t19-val-001",
+            "operator": "tester19",
+            "items": [
+                {"id": "CHG-001", "risk_level": "extreme_invalid"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", json_patch, "--mode", "skip"], sp, expect_fail=True)
+    assert_in("REJECTED", res.stdout, "t19 rejected due to validation error")
+    assert_in("invalid risk_level", res.stdout, "t19 reports invalid risk_level")
+
+    s = read_state(sp)
+    rej_events = [e for e in s["audit_log"] if e["action"] == "bulk_amend_rejected"]
+    assert_eq(len(rej_events), 1, "t19 audit has bulk_amend_rejected event")
+    cleanup_patterns(tmpdir, "state_t19.json")
+
+
+def test_20_resume_abort_per_item(tmpdir):
+    """resume + per-item=abort 导致整批中止"""
+    print("\n== Test 20: Resume per-item=abort cancels batch ==")
+    sp = os.path.join(tmpdir, "state_t20.json")
+    cleanup_patterns(tmpdir, "state_t20.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+    run_cli(["confirm", "changes"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t20.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t20-abort-001",
+            "operator": "tester20",
+            "items": [
+                {"id": "CHG-001", "owner": "A"},
+                {"id": "CHG-002", "owner": "B"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    run_cli(["bulk_amend", json_patch, "--operator", "tester20"], sp, expect_fail=True)
+
+    res_resume = run_cli(["bulk_amend", "--resume", "0", "--decision", "overwrite",
+                          "--operator", "主管", "--per-item", "CHG-001=abort"],
+                         sp, expect_fail=True)
+    assert_in("ABORT", res_resume.stdout, "t20 per-item=abort triggers whole-batch abort")
+
+    s = read_state(sp)
+    chg001 = next(it for it in s["items"] if it["id"] == "CHG-001")
+    chg002 = next(it for it in s["items"] if it["id"] == "CHG-002")
+    assert_eq(chg001["owner"], "张三", "t20 CHG-001 unchanged after abort")
+    assert_eq(chg002["owner"], "李四", "t20 CHG-002 unchanged after abort")
+    abort_events = [e for e in s["audit_log"] if e["action"] == "bulk_amend_aborted"
+                    and "resumed=true" in e["detail"]]
+    assert_eq(len(abort_events), 1, "t20 audit records resumed aborted event")
+    assert_eq(s["pending_bulk_ops"][0]["resolved"], True, "t20 pending still marked resolved even on abort")
+    cleanup_patterns(tmpdir, "state_t20.json")
+
+
 def main():
     global PASS, FAIL
     tmpdir = tempfile.mkdtemp(prefix="release_cli_test_")
@@ -408,6 +872,17 @@ def main():
         test_7_amend_fixes_bad_items_allows_approve(tmpdir)
         test_8_amend_rejects_invalid_and_nonexistent(tmpdir)
         test_9_amend_restart_consistency(tmpdir)
+        test_10_bulk_no_conflict_json_and_csv(tmpdir)
+        test_11_bulk_conflict_mode_abort(tmpdir)
+        test_12_bulk_conflict_mode_skip(tmpdir)
+        test_13_bulk_conflict_mode_overwrite(tmpdir)
+        test_14_section_confirmed_detection(tmpdir)
+        test_15_already_modified_conflict(tmpdir)
+        test_16_restart_conflict_resume(tmpdir)
+        test_17_full_e2e_bulk_workflow(tmpdir)
+        test_18_bulk_draft_newer_conflict(tmpdir)
+        test_19_bulk_invalid_risk_rejected(tmpdir)
+        test_20_resume_abort_per_item(tmpdir)
 
         print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
         if FAIL:
