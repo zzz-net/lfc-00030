@@ -15,10 +15,8 @@ PASS = 0
 FAIL = 0
 
 
-def run_cli(args, state_path, expect_fail=False, manifest_override=None):
+def run_cli(args, state_path, expect_fail=False):
     cmd = [sys.executable, CLI, "--rules", RULES, "--state", state_path] + args
-    if manifest_override and args[0] == "import":
-        cmd = [sys.executable, CLI, "--rules", RULES, "--state", state_path, "import", manifest_override]
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
     ok = res.returncode != 0 if expect_fail else res.returncode == 0
     if not ok:
@@ -84,22 +82,19 @@ def cleanup_patterns(workdir, state_filename=None):
                 pass
 
 
+def _amend_bad_items(sp):
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp)
+
+
 def test_1_rollback_after_approve(tmpdir):
-    """批准后可以回滚：清掉批准记录、恢复批准时的快照、可再重新批准+导出"""
     print("\n== Test 1: Rollback after approve ==")
     sp = os.path.join(tmpdir, "state_t1.json")
     cleanup_patterns(tmpdir, "state_t1.json")
 
     run_cli(["import", SAMPLE], sp)
     run_cli(["draft"], sp)
-    s = read_state(sp)
-    for it in s["items"]:
-        if not it["owner"]:
-            it["owner"] = "周七"
-        if it["risk_level"] == "extreme":
-            it["risk_level"] = "critical"
-    with open(sp, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2)
+    _amend_bad_items(sp)
     for sec in ["overview", "changes", "migration", "known_issues"]:
         run_cli(["confirm", sec], sp)
     run_cli(["draft"], sp)
@@ -130,21 +125,13 @@ def test_1_rollback_after_approve(tmpdir):
 
 
 def test_2_no_import_when_approved(tmpdir):
-    """批准状态下禁止导入新批次"""
     print("\n== Test 2: No new import when approved ==")
     sp = os.path.join(tmpdir, "state_t2.json")
     cleanup_patterns(tmpdir, "state_t2.json")
 
     run_cli(["import", SAMPLE], sp)
     run_cli(["draft"], sp)
-    s = read_state(sp)
-    for it in s["items"]:
-        if not it["owner"]:
-            it["owner"] = "周七"
-        if it["risk_level"] == "extreme":
-            it["risk_level"] = "critical"
-    with open(sp, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2)
+    _amend_bad_items(sp)
     for sec in ["overview", "changes", "migration", "known_issues"]:
         run_cli(["confirm", sec], sp)
     run_cli(["draft"], sp)
@@ -170,7 +157,6 @@ def test_2_no_import_when_approved(tmpdir):
 
 
 def test_3_bom_manifest_import(tmpdir):
-    """带 UTF-8 BOM 的清单能正常导入"""
     print("\n== Test 3: UTF-8 BOM manifest import ==")
     sp = os.path.join(tmpdir, "bom_state.json")
     bom_manifest = os.path.join(tmpdir, "manifest_bom.json")
@@ -188,21 +174,13 @@ def test_3_bom_manifest_import(tmpdir):
 
 
 def test_4_export_drift_rejection(tmpdir):
-    """批准后若手动修改了版本/草稿号，export会被拒绝"""
     print("\n== Test 4: Export drift rejection ==")
     sp = os.path.join(tmpdir, "state_t4.json")
     cleanup_patterns(tmpdir, "state_t4.json")
 
     run_cli(["import", SAMPLE], sp)
     run_cli(["draft"], sp)
-    s = read_state(sp)
-    for it in s["items"]:
-        if not it["owner"]:
-            it["owner"] = "周七"
-        if it["risk_level"] == "extreme":
-            it["risk_level"] = "critical"
-    with open(sp, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2)
+    _amend_bad_items(sp)
     for sec in ["overview", "changes", "migration", "known_issues"]:
         run_cli(["confirm", sec], sp)
     run_cli(["draft"], sp)
@@ -223,22 +201,13 @@ def test_4_export_drift_rejection(tmpdir):
 
 
 def test_5_restart_consistency(tmpdir):
-    """重启一致性：走完流程导出后，重新load state核对"""
     print("\n== Test 5: Restart consistency across multiple runs ==")
     sp = os.path.join(tmpdir, "state_t5.json")
     cleanup_patterns(tmpdir, "state_t5.json")
 
     run_cli(["import", SAMPLE], sp)
     run_cli(["draft"], sp)
-
-    s1 = read_state(sp)
-    for it in s1["items"]:
-        if not it["owner"]:
-            it["owner"] = "周七"
-        if it["risk_level"] == "extreme":
-            it["risk_level"] = "critical"
-    with open(sp, "w", encoding="utf-8") as f:
-        json.dump(s1, f, ensure_ascii=False, indent=2)
+    _amend_bad_items(sp)
 
     for sec in ["overview", "changes", "migration", "known_issues"]:
         run_cli(["confirm", sec], sp)
@@ -282,7 +251,6 @@ def test_5_restart_consistency(tmpdir):
 
 
 def test_6_duplicate_batch_counter_not_incremented(tmpdir):
-    """重复导入同一批不计数，imported_batches不变"""
     print("\n== Test 6: Duplicate batch not counted again ==")
     sp = os.path.join(tmpdir, "state_t6.json")
     cleanup_patterns(tmpdir, "state_t6.json")
@@ -296,6 +264,136 @@ def test_6_duplicate_batch_counter_not_incremented(tmpdir):
     cleanup_patterns(tmpdir, "state_t6.json")
 
 
+def test_7_amend_fixes_bad_items_allows_approve(tmpdir):
+    """核心场景：坏清单导入 → amend修正 → 草稿 → 确认 → 批准 → 导出，全程用 CLI 完成"""
+    print("\n== Test 7: Amend fixes bad items → full approve flow ==")
+    sp = os.path.join(tmpdir, "state_t7.json")
+    cleanup_patterns(tmpdir, "state_t7.json")
+
+    res = run_cli(["import", SAMPLE], sp)
+    assert_in("missing required field 'owner'", res.stdout, "CHG-003 flagged missing owner")
+    assert_in("invalid risk_level 'extreme'", res.stdout, "CHG-005 flagged invalid risk")
+
+    s = read_state(sp)
+    assert_eq(len(s["items"]), 5, "5 items imported (including bad ones)")
+    assert_eq(len(s["imported_batches"]), 1, "1 batch recorded")
+
+    res_approve_early = run_cli(["approve"], sp, expect_fail=True)
+    assert_in("Missing owner", res_approve_early.stdout, "approve blocked: missing owner")
+    assert_in("Invalid risk_level", res_approve_early.stdout, "approve blocked: invalid risk")
+
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp)
+    s = read_state(sp)
+    chg003 = next(it for it in s["items"] if it["id"] == "CHG-003")
+    assert_eq(chg003["owner"], "周七", "CHG-003 owner amended")
+    assert_eq(len(s["items"]), 5, "items count unchanged (no duplication)")
+
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp)
+    s = read_state(sp)
+    chg005 = next(it for it in s["items"] if it["id"] == "CHG-005")
+    assert_eq(chg005["risk_level"], "critical", "CHG-005 risk_level amended")
+    assert_eq(len(s["items"]), 5, "items count still 5 (no duplication)")
+
+    amend_entries = [e for e in s["audit_log"] if e["action"] == "amend"]
+    assert_eq(len(amend_entries), 2, "2 amend events in audit log")
+
+    run_cli(["draft"], sp)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+    run_cli(["draft"], sp)
+    run_cli(["approve"], sp)
+
+    s = read_state(sp)
+    assert_eq(s["approved"], True, "approve succeeds after amend")
+
+    export_out = os.path.join(tmpdir, "t7_final.md")
+    run_cli(["export", "-o", export_out], sp)
+    md = read_file(export_out)
+    assert_in("owner:周七", md, "final markdown has amended owner for CHG-003")
+    assert_in("risk:critical", md, "final markdown has amended risk for CHG-005")
+    assert_eq(md.count("CHG-003"), 1, "CHG-003 appears exactly once (no duplication)")
+    assert_eq(md.count("CHG-005"), 1, "CHG-005 appears exactly once (no duplication)")
+    cleanup_patterns(tmpdir, "state_t7.json")
+
+
+def test_8_amend_rejects_invalid_and_nonexistent(tmpdir):
+    """amend 的边界：不存在的 ID、非法 risk_level 被拒绝；已批准时 amend 自动撤销批准"""
+    print("\n== Test 8: Amend edge cases ==")
+    sp = os.path.join(tmpdir, "state_t8.json")
+    cleanup_patterns(tmpdir, "state_t8.json")
+
+    run_cli(["import", SAMPLE], sp)
+
+    res = run_cli(["amend", "CHG-999", "--field", "owner=test"], sp, expect_fail=True)
+    assert_in("not found", res.stdout, "amend rejects nonexistent item ID")
+
+    res = run_cli(["amend", "CHG-005", "--field", "risk_level=extreme2"], sp, expect_fail=True)
+    assert_in("Invalid risk_level", res.stdout, "amend rejects invalid risk_level value")
+
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp)
+    run_cli(["draft"], sp)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+    run_cli(["draft"], sp)
+    run_cli(["approve"], sp)
+
+    s = read_state(sp)
+    assert_eq(s["approved"], True, "approved before amend-in-approved-state test")
+
+    run_cli(["amend", "CHG-001", "--field", "owner=新负责人"], sp)
+    s = read_state(sp)
+    assert_eq(s["approved"], False, "amend after approval auto-clears approved flag")
+    assert_eq(s["approved_at_version"], None, "approved_at_version cleared on amend")
+    assert_eq(s["approved_at_draft_version"], None, "approved_at_draft_version cleared on amend")
+
+    amend_after = [e for e in s["audit_log"] if e["action"] == "amend" and "CHG-001" in e.get("detail", "")]
+    assert_eq(len(amend_after), 1, "audit log records the amend on CHG-001 after approval")
+
+    run_cli(["draft"], sp)
+    run_cli(["approve"], sp)
+    run_cli(["export"], sp)
+    s = read_state(sp)
+    assert_eq(s["approved"], True, "re-approve after amend works")
+    cleanup_patterns(tmpdir, "state_t8.json")
+
+
+def test_9_amend_restart_consistency(tmpdir):
+    """amend 后重启一致性：修正 → 草稿 → 批准 → 导出 → 重启 → 再导出 → 内容一致"""
+    print("\n== Test 9: Amend + restart consistency ==")
+    sp = os.path.join(tmpdir, "state_t9.json")
+    cleanup_patterns(tmpdir, "state_t9.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp)
+    run_cli(["draft"], sp)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+    run_cli(["draft"], sp)
+    run_cli(["approve"], sp)
+
+    out1 = os.path.join(tmpdir, "t9_final1.md")
+    run_cli(["export", "-o", out1], sp)
+    md1 = read_file(out1)
+    s1 = read_state(sp)
+
+    subprocess.run([sys.executable, "-c", "import gc; gc.collect()"], capture_output=True)
+
+    out2 = os.path.join(tmpdir, "t9_final2.md")
+    run_cli(["export", "-o", out2], sp)
+    md2 = read_file(out2)
+    s2 = read_state(sp)
+
+    md1_no_ts = "\n".join(l for l in md1.splitlines() if not l.startswith("_Generated at"))
+    md2_no_ts = "\n".join(l for l in md2.splitlines() if not l.startswith("_Generated at"))
+    assert_eq(md1_no_ts, md2_no_ts, "amend flow: two exports match after restart")
+    assert_eq(s1["approved_at_version"], s2["approved_at_version"],
+              "approved_at_version consistent across restarts")
+    assert_eq(len(s1["items"]), len(s2["items"]), "items count consistent across restarts")
+    cleanup_patterns(tmpdir, "state_t9.json")
+
+
 def main():
     global PASS, FAIL
     tmpdir = tempfile.mkdtemp(prefix="release_cli_test_")
@@ -307,6 +405,9 @@ def main():
         test_4_export_drift_rejection(tmpdir)
         test_5_restart_consistency(tmpdir)
         test_6_duplicate_batch_counter_not_incremented(tmpdir)
+        test_7_amend_fixes_bad_items_allows_approve(tmpdir)
+        test_8_amend_rejects_invalid_and_nonexistent(tmpdir)
+        test_9_amend_restart_consistency(tmpdir)
 
         print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
         if FAIL:

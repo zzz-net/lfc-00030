@@ -470,6 +470,58 @@ def cmd_rollback(args, rules):
     print(f"[OK] Rolled back to draft v{previous['version']}.")
 
 
+def cmd_amend(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found. Run 'import' first.")
+        sys.exit(1)
+
+    item_id = args.item_id
+    fields = args.field
+
+    if not fields:
+        print("[ERROR] No fields to amend. Use --field key=value (may repeat).")
+        sys.exit(1)
+
+    target = None
+    for it in state.get("items", []):
+        if it.get("id") == item_id:
+            target = it
+            break
+
+    if target is None:
+        print(f"[ERROR] Item '{item_id}' not found in current state.")
+        sys.exit(1)
+
+    valid_risks = rules.get("valid_risk_levels", [])
+    changes = {}
+    for fv in fields:
+        if "=" not in fv:
+            print(f"[ERROR] Invalid field format '{fv}', expected key=value")
+            sys.exit(1)
+        k, v = fv.split("=", 1)
+        if k == "risk_level" and valid_risks and v not in valid_risks:
+            print(f"[ERROR] Invalid risk_level '{v}'. Valid: {valid_risks}")
+            sys.exit(1)
+        changes[k] = v
+
+    for k, v in changes.items():
+        old = target.get(k, "")
+        target[k] = v
+        print(f"  {item_id}.{k}: '{old}' -> '{v}'")
+
+    if state.get("approved"):
+        state["approved"] = False
+        state["approved_at_version"] = None
+        state["approved_at_draft_version"] = None
+        print(f"  [NOTE] Approval cleared (data changed after approval).")
+
+    _audit(state, "amend", f"item={item_id} fields={changes}")
+    save_state(state, state_path)
+    print(f"[OK] Item '{item_id}' amended.")
+
+
 def cmd_export(args, rules):
     state_path = args.state
     state = load_state(state_path)
@@ -586,6 +638,11 @@ def main():
     sub.add_parser("approve", help="Approve the release version")
     sub.add_parser("rollback", help="Rollback to previous draft")
 
+    p_amend = sub.add_parser("amend", help="Amend a field on an existing item")
+    p_amend.add_argument("item_id", help="Item ID to amend (e.g. CHG-003)")
+    p_amend.add_argument("--field", action="append", default=[],
+                         help="Field to amend as key=value (repeatable, e.g. --field owner=周七 --field risk_level=critical)")
+
     p_export = sub.add_parser("export", help="Export final release notes")
     p_export.add_argument("-o", "--output", help="Output file path")
 
@@ -602,6 +659,7 @@ def main():
         "reject": cmd_reject,
         "approve": cmd_approve,
         "rollback": cmd_rollback,
+        "amend": cmd_amend,
         "export": cmd_export,
         "status": cmd_status,
         "history": cmd_history,
