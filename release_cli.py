@@ -122,11 +122,9 @@ def _build_package(state, operator, rules_path, description):
         "package_format_version": PACKAGE_FORMAT_VERSION,
         "exported_at": datetime.now().isoformat(),
         "exported_by": operator or _get_identity(),
-        "exported_from": platform.node(),
         "description": description or "",
         "state": copy.deepcopy(state),
         "state_checksum": _compute_state_checksum(state),
-        "rules_path": rules_path,
         "rules_snapshot": rules_copy,
         "metadata": {
             "version": state.get("version"),
@@ -159,6 +157,390 @@ def _validate_package(package):
     if expected != package["state_checksum"]:
         return False, f"State checksum mismatch: package may be corrupted"
     return True, "Package valid"
+
+
+def _compute_deep_diff(target_state, package_state):
+    result = {
+        "items": {
+            "added": [],
+            "removed": [],
+            "modified": [],
+        },
+        "migration_reminders": {
+            "added": [],
+            "removed": [],
+            "modified": [],
+        },
+        "known_issues": {
+            "added": [],
+            "removed": [],
+            "modified": [],
+        },
+        "metadata": {
+            "version_changed": False,
+            "version_old": None,
+            "version_new": None,
+            "draft_version_changed": False,
+            "draft_version_old": None,
+            "draft_version_new": None,
+            "approved_changed": False,
+            "approved_old": None,
+            "approved_new": None,
+            "confirmations_changed": [],
+        },
+        "field_changes": {},
+    }
+
+    t_version = target_state.get("version")
+    p_version = package_state.get("version")
+    if t_version != p_version:
+        result["metadata"]["version_changed"] = True
+        result["metadata"]["version_old"] = t_version
+        result["metadata"]["version_new"] = p_version
+
+    t_dv = target_state.get("draft_version", 0)
+    p_dv = package_state.get("draft_version", 0)
+    if t_dv != p_dv:
+        result["metadata"]["draft_version_changed"] = True
+        result["metadata"]["draft_version_old"] = t_dv
+        result["metadata"]["draft_version_new"] = p_dv
+
+    t_approved = target_state.get("approved", False)
+    p_approved = package_state.get("approved", False)
+    if t_approved != p_approved:
+        result["metadata"]["approved_changed"] = True
+        result["metadata"]["approved_old"] = t_approved
+        result["metadata"]["approved_new"] = p_approved
+
+    t_conf = target_state.get("confirmations", {})
+    p_conf = package_state.get("confirmations", {})
+    all_conf_sections = set(list(t_conf.keys()) + list(p_conf.keys()))
+    for sec in all_conf_sections:
+        if t_conf.get(sec) != p_conf.get(sec):
+            result["metadata"]["confirmations_changed"].append({
+                "section": sec,
+                "old": t_conf.get(sec),
+                "new": p_conf.get(sec),
+            })
+
+    def _diff_list(target_list, package_list, id_field, category_name):
+        t_ids = {it.get(id_field) for it in target_list}
+        p_ids = {it.get(id_field) for it in package_list}
+        t_by_id = {it.get(id_field): it for it in target_list}
+        p_by_id = {it.get(id_field): it for it in package_list}
+
+        for pid in p_ids - t_ids:
+            result[category_name]["added"].append({"id": pid, "item": p_by_id[pid]})
+
+        for tid in t_ids - p_ids:
+            result[category_name]["removed"].append({"id": tid, "item": t_by_id[tid]})
+
+        for common_id in t_ids & p_ids:
+            t_item = t_by_id[common_id]
+            p_item = p_by_id[common_id]
+            diffs = _compute_field_diff(t_item, p_item)
+            if diffs:
+                result[category_name]["modified"].append({
+                    "id": common_id,
+                    "diffs": diffs,
+                    "old": t_item,
+                    "new": p_item,
+                })
+                result["field_changes"][f"{category_name}:{common_id}"] = diffs
+
+    _diff_list(
+        target_state.get("items", []),
+        package_state.get("items", []),
+        "id", "items"
+    )
+    _diff_list(
+        target_state.get("migration_reminders", []),
+        package_state.get("migration_reminders", []),
+        "id", "migration_reminders"
+    )
+    _diff_list(
+        target_state.get("known_issues", []),
+        package_state.get("known_issues", []),
+        "id", "known_issues"
+    )
+
+    return result
+
+
+def _compare_rules_diff(local_rules_path, package_rules_snapshot):
+    if not package_rules_snapshot:
+        return {"has_rules_snapshot": False, "diff": None}
+
+    local_rules = None
+    if local_rules_path and os.path.exists(local_rules_path):
+        with open(local_rules_path, "r", encoding="utf-8") as f:
+            local_rules = f.read()
+
+    if local_rules is None:
+        return {
+            "has_rules_snapshot": True,
+            "local_rules_missing": True,
+            "diff": None,
+        }
+
+    local_lines = local_rules.splitlines()
+    package_lines = package_rules_snapshot.splitlines()
+
+    added = []
+    removed = []
+    for i, line in enumerate(package_lines):
+        if line.strip() and line not in local_lines:
+            added.append((i + 1, line))
+    for i, line in enumerate(local_lines):
+        if line.strip() and line not in package_lines:
+            removed.append((i + 1, line))
+
+    return {
+        "has_rules_snapshot": True,
+        "local_rules_missing": False,
+        "added": added,
+        "removed": removed,
+        "identical": len(added) == 0 and len(removed) == 0,
+    }
+
+
+def _suggest_import_mode(age_info, deep_diff, target_state):
+    suggestions = []
+
+    if target_state is None:
+        return {
+            "recommended_mode": "takeover",
+            "reason": "Target state does not exist - takeover will create new state from package",
+            "alternative_modes": ["merge"],
+            "risk_level": "low",
+        }
+
+    risk_level = "low"
+    reasons = []
+
+    if age_info["target_newer"]:
+        risk_level = "high"
+        reasons.append(f"Target state is NEWER (score {age_info['target_score']} vs {age_info['package_score']})")
+        reasons.append("  - Target may have work that will be overwritten by takeover")
+        reasons.append("  - Use --force with takeover to override, or use merge mode")
+
+    if age_info["target_approved"]:
+        risk_level = "high"
+        reasons.append("Target state is already APPROVED")
+        reasons.append("  - Import will clear approved status")
+        reasons.append("  - Use --force to override")
+
+    items_modified = len(deep_diff["items"]["modified"])
+    items_removed = len(deep_diff["items"]["removed"])
+    items_added = len(deep_diff["items"]["added"])
+    conf_changed = len(deep_diff["metadata"]["confirmations_changed"])
+
+    if items_modified > 0:
+        risk_level = "medium" if risk_level == "low" else risk_level
+        reasons.append(f"Package will MODIFY {items_modified} existing items")
+
+    if items_removed > 0:
+        risk_level = "high"
+        reasons.append(f"Package will REMOVE {items_removed} items present in target")
+
+    if items_added > 0:
+        reasons.append(f"Package will ADD {items_added} new items")
+
+    if conf_changed > 0:
+        reasons.append(f"Package will CHANGE {conf_changed} confirmation statuses")
+
+    total_items = len(target_state.get("items", [])) if target_state else 0
+    if items_removed > 0 or (total_items > 0 and items_modified > total_items * 0.5):
+        recommended_mode = "takeover"
+        reasons.append("Recommended mode: takeover (significant structural changes)")
+    elif age_info["target_newer"]:
+        recommended_mode = "merge"
+        reasons.append("Recommended mode: merge (preserve target history while applying package content)")
+    else:
+        recommended_mode = "takeover"
+        reasons.append("Recommended mode: takeover (clean replacement)")
+
+    return {
+        "recommended_mode": recommended_mode,
+        "alternative_modes": ["merge"] if recommended_mode == "takeover" else ["takeover"],
+        "risk_level": risk_level,
+        "reasons": reasons,
+        "force_required": age_info["target_newer"] or age_info["target_approved"],
+    }
+
+
+def cmd_preflight_check(args, rules):
+    package_path = args.package
+    state_path = args.state
+
+    if not os.path.exists(package_path):
+        print(f"[ERROR] Package file not found: {package_path}")
+        sys.exit(1)
+
+    with open(package_path, "r", encoding="utf-8") as f:
+        package = json.load(f)
+
+    valid, msg = _validate_package(package)
+    if not valid:
+        print(f"[REJECTED] Package validation failed: {msg}")
+        sys.exit(1)
+
+    package_state = package["state"]
+    target_state = load_state(state_path)
+
+    print("\n" + "=" * 70)
+    print("PACKAGE PREFLIGHT CHECK")
+    print("=" * 70)
+
+    print(f"\n[Package Information]")
+    print(f"  Format version:  {package['package_format_version']}")
+    print(f"  Exported at:     {package.get('exported_at')}")
+    print(f"  Exported by:     {package.get('exported_by')}")
+    if package.get('description'):
+        print(f"  Description:     {package.get('description')}")
+    print(f"  Package state:   v{package_state.get('version')} / draft v{package_state.get('draft_version')}")
+    print(f"  Items:           {len(package_state.get('items', []))}")
+    print(f"  Approved:        {package_state.get('approved', False)}")
+
+    print(f"\n[Target State]")
+    if target_state is None:
+        print(f"  Status:          NOT INITIALIZED (will create new state)")
+    else:
+        print(f"  Version:         v{target_state.get('version')}")
+        print(f"  Draft:           v{target_state.get('draft_version', 0)}")
+        print(f"  Approved:        {target_state.get('approved', False)}")
+        print(f"  Items:           {len(target_state.get('items', []))}")
+
+    print(f"\n[Validation]")
+    print(f"  Checksum:        OK")
+    print(f"  Format:          OK")
+
+    age_info = _compare_state_age(target_state or package_state, package_state)
+    if target_state is not None:
+        print(f"\n[State Age Comparison]")
+        print(f"  Target score:    {age_info['target_score']}")
+        print(f"  Package score:   {age_info['package_score']}")
+        print(f"  Target newer:    {age_info['target_newer']}")
+        if age_info['target_last_modified']:
+            print(f"  Target modified: {age_info['target_last_modified']}")
+        if age_info['package_last_modified']:
+            print(f"  Package modified:{age_info['package_last_modified']}")
+
+    rules_diff = _compare_rules_diff(args.rules, package.get("rules_snapshot"))
+    print(f"\n[Rules Snapshot Diff]")
+    if rules_diff.get("has_rules_snapshot"):
+        if rules_diff.get("local_rules_missing"):
+            print(f"  Status:          Package has rules snapshot, but local rules file missing")
+            print(f"  Recommend:       Use --apply-rules-snapshot during import_package to restore rules")
+        elif rules_diff.get("identical"):
+            print(f"  Status:          IDENTICAL to local rules")
+        else:
+            print(f"  Status:          DIFFERS from local rules")
+            added = rules_diff.get("added", [])
+            removed = rules_diff.get("removed", [])
+            if added:
+                print(f"  Lines in package but not in local: {len(added)}")
+                for ln, line in added[:5]:
+                    print(f"    + L{ln}: {line.strip()}")
+                if len(added) > 5:
+                    print(f"    ... and {len(added) - 5} more")
+            if removed:
+                print(f"  Lines in local but not in package: {len(removed)}")
+                for ln, line in removed[:5]:
+                    print(f"    - L{ln}: {line.strip()}")
+                if len(removed) > 5:
+                    print(f"    ... and {len(removed) - 5} more")
+            print(f"  Recommend:       Review rules diff. Use --apply-rules-snapshot to use package rules.")
+    else:
+        print(f"  Status:          No rules snapshot in package (exported with --no-rules)")
+
+    deep_diff = _compute_deep_diff(target_state or package_state, package_state) if target_state is not None else None
+    if target_state is not None and deep_diff:
+        print(f"\n[Content Diff Summary]")
+        items_added = len(deep_diff["items"]["added"])
+        items_removed = len(deep_diff["items"]["removed"])
+        items_modified = len(deep_diff["items"]["modified"])
+        print(f"  Items:           +{items_added} -{items_removed} ~{items_modified}")
+
+        mig_added = len(deep_diff["migration_reminders"]["added"])
+        mig_removed = len(deep_diff["migration_reminders"]["removed"])
+        mig_modified = len(deep_diff["migration_reminders"]["modified"])
+        print(f"  Migrations:      +{mig_added} -{mig_removed} ~{mig_modified}")
+
+        ki_added = len(deep_diff["known_issues"]["added"])
+        ki_removed = len(deep_diff["known_issues"]["removed"])
+        ki_modified = len(deep_diff["known_issues"]["modified"])
+        print(f"  Known issues:    +{ki_added} -{ki_removed} ~{ki_modified}")
+
+        if deep_diff["metadata"]["version_changed"]:
+            print(f"  Version:         {deep_diff['metadata']['version_old']} -> {deep_diff['metadata']['version_new']}")
+        if deep_diff["metadata"]["draft_version_changed"]:
+            print(f"  Draft version:   v{deep_diff['metadata']['draft_version_old']} -> v{deep_diff['metadata']['draft_version_new']}")
+        if deep_diff["metadata"]["approved_changed"]:
+            print(f"  Approved:        {deep_diff['metadata']['approved_old']} -> {deep_diff['metadata']['approved_new']}")
+
+        print(f"\n[Items to be Modified]")
+        if items_modified > 0:
+            for item in deep_diff["items"]["modified"][:10]:
+                print(f"  - {item['id']}:")
+                for d in item["diffs"]:
+                    print(f"      {d['field']}: {d['old']!r} -> {d['new']!r}")
+            if items_modified > 10:
+                print(f"  ... and {items_modified - 10} more modified items")
+        else:
+            print(f"  (none)")
+
+        print(f"\n[Confirmation Status Changes]")
+        conf_changes = deep_diff["metadata"]["confirmations_changed"]
+        if conf_changes:
+            for c in conf_changes:
+                status_old = "CONFIRMED" if c["old"] else "PENDING"
+                status_new = "CONFIRMED" if c["new"] else "PENDING"
+                arrow = ">>>" if c["new"] else "<<<"
+                print(f"  {arrow} {c['section']}: {status_old} -> {status_new}")
+        else:
+            print(f"  (no changes)")
+
+        print(f"\n[Conflict Risk Analysis]")
+        mode_suggestion = _suggest_import_mode(age_info, deep_diff, target_state)
+        risk_color = {
+            "low": "LOW",
+            "medium": "MEDIUM",
+            "high": "HIGH",
+        }.get(mode_suggestion["risk_level"], mode_suggestion["risk_level"])
+        print(f"  Risk level:      {risk_color}")
+        for reason in mode_suggestion["reasons"]:
+            print(f"  {reason}")
+        print(f"\n  Recommended mode: {mode_suggestion['recommended_mode']}")
+        print(f"  Alternatives:     {', '.join(mode_suggestion['alternative_modes'])}")
+        if mode_suggestion["force_required"]:
+            print(f"  Force required:   YES (add --force)")
+        else:
+            print(f"  Force required:   NO")
+    else:
+        print(f"\n[Conflict Risk Analysis]")
+        print(f"  Risk level:      LOW")
+        print(f"  Recommended mode: takeover (clean initialization)")
+        print(f"  Alternatives:     merge")
+        print(f"  Force required:   NO")
+
+    print(f"\n[Import Commands]")
+    if target_state is None:
+        print(f"  # Fresh import (create new state):")
+        print(f"  release_cli.py --state {state_path} import_package {package_path} --mode takeover --operator <your-name>")
+    else:
+        print(f"  # Recommended import:")
+        mode = mode_suggestion.get("recommended_mode", "takeover")
+        force_flag = " --force" if mode_suggestion.get("force_required") else ""
+        print(f"  release_cli.py --state {state_path} import_package {package_path} --mode {mode}{force_flag} --operator <your-name>")
+        print(f"\n  # Alternative modes:")
+        for alt in mode_suggestion.get("alternative_modes", []):
+            print(f"  release_cli.py --state {state_path} import_package {package_path} --mode {alt}{force_flag} --operator <your-name>")
+
+    print("\n" + "=" * 70)
+    print("PREFLIGHT COMPLETE - No state changes made")
+    print("=" * 70)
+    print()
 
 
 def _compare_state_age(target_state, package_state):
@@ -256,11 +638,12 @@ def cmd_import_package(args, rules):
     operator = args.operator or _get_identity()
     mode = args.mode or "merge"
 
+    target_state_snapshot = copy.deepcopy(target_state) if target_state else None
+
     print(f"\n== Import Package: '{package_path}' ==")
     print(f"   Package format:  {package['package_format_version']}")
     print(f"   Exported at:     {package.get('exported_at')}")
     print(f"   Exported by:     {package.get('exported_by')}")
-    print(f"   Exported from:   {package.get('exported_from')}")
     print(f"   Package state:   v{package_state.get('version')} / draft v{package_state.get('draft_version')}")
     print(f"   Import mode:     {mode}")
     print(f"   Imported by:     {operator}")
@@ -371,6 +754,51 @@ def cmd_import_package(args, rules):
         print(f"[INFO] Rules snapshot restored to {args.rules}")
         _audit(final_state, "rules_restored",
                f"from_package={package_path} operator={operator}")
+
+    if mode == "takeover" and target_state_snapshot is not None:
+        deep_diff = _compute_deep_diff(target_state_snapshot, package_state)
+        takeover_snapshot = {
+            "takeover_id": hashlib.sha256(
+                f"{datetime.now().isoformat()}{operator}{package_path}".encode()
+            ).hexdigest()[:16],
+            "imported_at": datetime.now().isoformat(),
+            "imported_by": operator,
+            "exported_by": package.get("exported_by"),
+            "exported_at": package.get("exported_at"),
+            "package_path": os.path.basename(package_path),
+            "mode": mode,
+            "force": args.force,
+            "pre_import_state": target_state_snapshot,
+            "post_import_state": copy.deepcopy(final_state),
+            "diff": deep_diff,
+            "resumed_across_restart": False,
+        }
+        final_state.setdefault("takeover_history", []).append(takeover_snapshot)
+        _audit(final_state, "takeover_snapshot_stored",
+               f"takeover_id={takeover_snapshot['takeover_id']} "
+               f"operator={operator} mode={mode} "
+               f"modified_items={len(deep_diff['items']['modified'])} "
+               f"added_items={len(deep_diff['items']['added'])} "
+               f"removed_items={len(deep_diff['items']['removed'])}")
+    elif mode == "takeover" and target_state_snapshot is None:
+        takeover_snapshot = {
+            "takeover_id": hashlib.sha256(
+                f"{datetime.now().isoformat()}{operator}{package_path}".encode()
+            ).hexdigest()[:16],
+            "imported_at": datetime.now().isoformat(),
+            "imported_by": operator,
+            "exported_by": package.get("exported_by"),
+            "exported_at": package.get("exported_at"),
+            "package_path": os.path.basename(package_path),
+            "mode": mode,
+            "force": args.force,
+            "pre_import_state": None,
+            "post_import_state": copy.deepcopy(final_state),
+            "diff": None,
+            "note": "fresh_import_no_target_state",
+            "resumed_across_restart": False,
+        }
+        final_state.setdefault("takeover_history", []).append(takeover_snapshot)
 
     save_state(final_state, state_path)
 
@@ -946,6 +1374,162 @@ def cmd_history(args, rules):
         action = entry.get("action", "?")
         detail = entry.get("detail", "")
         print(f"  [{ts}] {action}: {detail}")
+
+
+def cmd_audit_view(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[INFO] No state found.")
+        return
+
+    takeover_history = state.get("takeover_history", [])
+    if not takeover_history:
+        print("[INFO] No takeover history found.")
+        print("  (This state was never imported via import_package mode=takeover)")
+        return
+
+    print("\n" + "=" * 70)
+    print("AUDIT VIEW - Takeover Timeline")
+    print("=" * 70)
+
+    for idx, takeover in enumerate(reversed(takeover_history)):
+        tid = takeover.get("takeover_id", "?")
+        print(f"\n{'─' * 70}")
+        print(f"Takeover #{len(takeover_history) - idx}: {tid}")
+        print(f"{'─' * 70}")
+        print(f"  Imported at:    {takeover.get('imported_at')}")
+        print(f"  Imported by:    {takeover.get('imported_by')}")
+        print(f"  Exported by:    {takeover.get('exported_by')}")
+        print(f"  Exported at:    {takeover.get('exported_at')}")
+        print(f"  Package:        {takeover.get('package_path')}")
+        print(f"  Mode:           {takeover.get('mode')}")
+        print(f"  Force:          {takeover.get('force', False)}")
+        if takeover.get('note'):
+            print(f"  Note:           {takeover.get('note')}")
+
+        pre_state = takeover.get("pre_import_state")
+        post_state = takeover.get("post_import_state")
+
+        if pre_state and post_state:
+            print(f"\n  [State Transition]")
+            print(f"    Before: v{pre_state.get('version')} / draft v{pre_state.get('draft_version', 0)} / "
+                  f"approved={pre_state.get('approved', False)}")
+            print(f"    After:  v{post_state.get('version')} / draft v{post_state.get('draft_version', 0)} / "
+                  f"approved={post_state.get('approved', False)}")
+
+        diff = takeover.get("diff")
+        if diff:
+            print(f"\n  [Item Changes]")
+            items_mod = diff["items"]["modified"]
+            items_add = diff["items"]["added"]
+            items_rem = diff["items"]["removed"]
+
+            if items_add:
+                print(f"    + ADDED ({len(items_add)} items):")
+                for item in items_add[:5]:
+                    print(f"      - {item['id']}: {item['item'].get('title', '')}")
+                if len(items_add) > 5:
+                    print(f"      ... and {len(items_add) - 5} more")
+
+            if items_rem:
+                print(f"    - REMOVED ({len(items_rem)} items):")
+                for item in items_rem[:5]:
+                    print(f"      - {item['id']}: {item['item'].get('title', '')}")
+                if len(items_rem) > 5:
+                    print(f"      ... and {len(items_rem) - 5} more")
+
+            if items_mod:
+                print(f"    ~ MODIFIED ({len(items_mod)} items):")
+                for item in items_mod[:10]:
+                    print(f"      - {item['id']}:")
+                    for d in item["diffs"]:
+                        old_repr = str(d["old"])[:30] if len(str(d["old"])) > 30 else str(d["old"])
+                        new_repr = str(d["new"])[:30] if len(str(d["new"])) > 30 else str(d["new"])
+                        print(f"        {d['field']}: {old_repr!r} -> {new_repr!r}")
+                if len(items_mod) > 10:
+                    print(f"      ... and {len(items_mod) - 10} more modified items")
+
+            print(f"\n  [Confirmation Status Changes]")
+            conf_changes = diff["metadata"]["confirmations_changed"]
+            if conf_changes:
+                for c in conf_changes:
+                    status_old = "CONFIRMED" if c["old"] else "PENDING"
+                    status_new = "CONFIRMED" if c["new"] else "PENDING"
+                    arrow = ">>>" if c["new"] else "<<<"
+                    print(f"    {arrow} {c['section']}: {status_old} -> {status_new}")
+            else:
+                print(f"    (no changes)")
+
+            print(f"\n  [Migration Reminder Changes]")
+            mig_mod = diff["migration_reminders"]["modified"]
+            mig_add = diff["migration_reminders"]["added"]
+            mig_rem = diff["migration_reminders"]["removed"]
+            if mig_add or mig_rem or mig_mod:
+                print(f"    +{len(mig_add)} -{len(mig_rem)} ~{len(mig_mod)}")
+                for m in mig_mod[:3]:
+                    print(f"      ~ {m['id']}:")
+                    for d in m["diffs"]:
+                        print(f"        {d['field']}: {d['old']!r} -> {d['new']!r}")
+            else:
+                print(f"    (no changes)")
+
+            print(f"\n  [Known Issue Changes]")
+            ki_mod = diff["known_issues"]["modified"]
+            ki_add = diff["known_issues"]["added"]
+            ki_rem = diff["known_issues"]["removed"]
+            if ki_add or ki_rem or ki_mod:
+                print(f"    +{len(ki_add)} -{len(ki_rem)} ~{len(ki_mod)}")
+                for k in ki_mod[:3]:
+                    print(f"      ~ {k['id']}:")
+                    for d in k["diffs"]:
+                        print(f"        {d['field']}: {d['old']!r} -> {d['new']!r}")
+            else:
+                print(f"    (no changes)")
+
+        print(f"\n  [Decisions]")
+        print(f"    Decision maker: {takeover.get('imported_by')}")
+        print(f"    Decision time:  {takeover.get('imported_at')}")
+        if takeover.get('resumed_across_restart'):
+            print(f"    Cross-restart:  YES (resumed after process restart)")
+        else:
+            print(f"    Cross-restart:  NO (same process session)")
+
+    print(f"\n{'─' * 70}")
+    print(f"[Timeline Summary]")
+    all_events = []
+
+    log = state.get("audit_log", [])
+    for entry in log:
+        all_events.append({
+            "ts": entry.get("timestamp", "?"),
+            "type": "audit",
+            "action": entry.get("action", "?"),
+            "detail": entry.get("detail", ""),
+        })
+
+    for takeover in takeover_history:
+        all_events.append({
+            "ts": takeover.get("imported_at"),
+            "type": "takeover",
+            "action": "import_package_takeover",
+            "detail": f"takeover_id={takeover.get('takeover_id')} by {takeover.get('imported_by')}",
+            "resumed": takeover.get("resumed_across_restart", False),
+        })
+
+    all_events.sort(key=lambda x: x.get("ts", ""))
+
+    print(f"  Total events: {len(all_events)}")
+    print()
+    for ev in all_events:
+        tag = "[TAKEOVER]" if ev["type"] == "takeover" else "[AUDIT]"
+        resumed_tag = " [RESUMED]" if ev.get("resumed") else ""
+        print(f"  [{ev['ts']}] {tag}{resumed_tag} {ev['action']}: {ev['detail'][:80]}")
+
+    print("\n" + "=" * 70)
+    print("AUDIT VIEW COMPLETE")
+    print("=" * 70)
+    print()
 
 
 def _find_in_list(items_list, item_id, id_field="id"):
@@ -1794,6 +2378,12 @@ def main():
     p_import_pkg.add_argument("--apply-rules-snapshot", action="store_true",
                               help="Apply rules snapshot from package to local rules.yaml")
 
+    p_preflight = sub.add_parser("preflight_check", help="Pre-check a package without modifying state - show diffs, conflicts, recommended mode")
+    p_preflight.add_argument("package", help="Path to package .json file to preflight")
+    p_preflight.add_argument("--operator", help="Operator identifier (for audit, though no state is written)")
+
+    p_audit_view = sub.add_parser("audit_view", help="Show audit timeline of takeovers - field changes, decision makers, cross-restart status")
+
     args = parser.parse_args()
     rules = load_rules(args.rules)
 
@@ -1811,6 +2401,8 @@ def main():
         "history": cmd_history,
         "export_package": cmd_export_package,
         "import_package": cmd_import_package,
+        "preflight_check": cmd_preflight_check,
+        "audit_view": cmd_audit_view,
     }
 
     fn = dispatch.get(args.command)

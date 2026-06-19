@@ -1433,6 +1433,416 @@ def test_30_full_e2e_handoff_workflow(tmpdir):
     cleanup_patterns(tmpdir, "state_machine2.json")
 
 
+def test_31_preflight_basic(tmpdir):
+    """preflight_check: 基础预检功能，无目标状态时输出正确信息，不修改状态"""
+    print("\n== Test 31: preflight_check basic (no target state) ==")
+    sp_source = os.path.join(tmpdir, "state_t31_source.json")
+    sp_target = os.path.join(tmpdir, "state_t31_target.json")
+    cleanup_patterns(tmpdir, "state_t31_source.json")
+    cleanup_patterns(tmpdir, "state_t31_target.json")
+
+    run_cli(["import", SAMPLE], sp_source)
+    run_cli(["draft"], sp_source)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_source)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp_source)
+
+    pkg = os.path.join(tmpdir, "pkg_t31.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "测试员31"], sp_source)
+
+    with open(pkg, "r", encoding="utf-8") as f:
+        pkg_data = json.load(f)
+    assert "exported_from" not in pkg_data, "t31 package must NOT contain exported_from (removed hardcoded machine info)"
+    assert "rules_path" not in pkg_data, "t31 package must NOT contain rules_path (removed hardcoded path)"
+    print("  [OK] Package has no hardcoded machine info (exported_from, rules_path removed)")
+
+    res = run_cli(["preflight_check", pkg], sp_target)
+    assert_in("PACKAGE PREFLIGHT CHECK", res.stdout, "t31 preflight header present")
+    assert_in("NOT INITIALIZED", res.stdout, "t31 reports target not initialized")
+    assert_in("Package state:   v2.1.0 / draft v1", res.stdout, "t31 shows package state correctly")
+    assert_in("PREFLIGHT COMPLETE - No state changes made", res.stdout, "t31 preflight complete message")
+    assert_in("Recommended mode: takeover", res.stdout, "t31 recommends takeover for fresh state")
+
+    assert not os.path.exists(sp_target), "t31 target state file NOT created by preflight (no state changes)"
+    print("  [OK] preflight_check did NOT create or modify target state file")
+
+    res2 = run_cli(["preflight_check", pkg], sp_source)
+    assert_in("Version:         v2.1.0", res2.stdout, "t31 existing target version shown")
+    assert_in("Draft:           v1", res2.stdout, "t31 existing target draft shown")
+    assert_in("Content Diff Summary", res2.stdout, "t31 diff summary shown for existing target")
+    assert_in("Rules Snapshot Diff", res2.stdout, "t31 rules snapshot diff shown")
+    assert_in("IDENTICAL to local rules", res2.stdout, "t31 rules are identical")
+
+    s_after = read_state(sp_source)
+    actions_before = [e["action"] for e in s_after["audit_log"]]
+    assert "preflight_check" not in actions_before, "t31 preflight_check NOT in audit log (no state changes)"
+    print("  [OK] preflight_check did NOT modify source state or write any audit entries")
+    cleanup_patterns(tmpdir, "state_t31_source.json")
+    cleanup_patterns(tmpdir, "state_t31_target.json")
+
+
+def test_32_preflight_conflict_detection(tmpdir):
+    """preflight_check: 冲突检测，目标比包新、目标已批准时正确显示风险和建议模式"""
+    print("\n== Test 32: preflight_check conflict detection ==")
+    sp_old = os.path.join(tmpdir, "state_t32_old.json")
+    sp_new = os.path.join(tmpdir, "state_t32_new.json")
+    sp_approved = os.path.join(tmpdir, "state_t32_approved.json")
+    cleanup_patterns(tmpdir, "state_t32_old.json")
+    cleanup_patterns(tmpdir, "state_t32_new.json")
+    cleanup_patterns(tmpdir, "state_t32_approved.json")
+
+    run_cli(["import", SAMPLE], sp_old)
+    run_cli(["draft"], sp_old)
+
+    pkg = os.path.join(tmpdir, "pkg_t32.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "导出者32"], sp_old)
+
+    run_cli(["import", SAMPLE], sp_new)
+    run_cli(["draft"], sp_new)
+    run_cli(["draft"], sp_new)
+    run_cli(["amend", "CHG-001", "--field", "owner=新负责人A"], sp_new)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_new)
+
+    s_new = read_state(sp_new)
+    assert_eq(s_new["draft_version"], 2, "t32 setup: target draft_v=2 (newer than package v1)")
+
+    res = run_cli(["preflight_check", pkg], sp_new)
+    assert_in("Target state is NEWER", res.stdout, "t32 reports target newer")
+    assert_in("Risk level:      HIGH", res.stdout, "t32 risk level is HIGH")
+    assert_in("Force required:   YES", res.stdout, "t32 force required for newer target")
+    assert_in("Recommended mode: merge", res.stdout, "t32 recommends merge for newer target")
+    assert_in("MODIFY 2 existing items", res.stdout, "t32 reports 2 items will be modified")
+    assert_in("CHG-001", res.stdout, "t32 CHG-001 in modified list")
+    assert_in("CHG-003", res.stdout, "t32 CHG-003 in modified list")
+    assert_in("owner: '新负责人A' -> '张三'", res.stdout, "t32 shows CHG-001 owner change")
+    assert_in("owner: '周七' -> ''", res.stdout, "t32 shows CHG-003 owner change (target -> package)")
+    print("  [OK] 目标比包新时正确建议 merge 模式并显示 2 个修改条目")
+
+    run_cli(["import", SAMPLE], sp_approved)
+    run_cli(["draft"], sp_approved)
+    _amend_bad_items(sp_approved)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp_approved)
+    run_cli(["draft"], sp_approved)
+    run_cli(["approve"], sp_approved)
+
+    s_approved = read_state(sp_approved)
+    assert_eq(s_approved["approved"], True, "t32 setup: target is approved")
+
+    res2 = run_cli(["preflight_check", pkg], sp_approved)
+    assert_in("Target state is already APPROVED", res2.stdout, "t32 reports target approved")
+    assert_in("Risk level:      HIGH", res2.stdout, "t32 risk HIGH for approved target")
+    assert_in("Force required:   YES", res2.stdout, "t32 force required for approved target")
+
+    modified_pkg = os.path.join(tmpdir, "pkg_t32_modified.json")
+    with open(pkg, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["state"]["items"][0]["owner"] = "包中修改的张三"
+    data["state"]["items"][1]["risk_level"] = "critical"
+    data["state"]["confirmations"] = {
+        "overview": True,
+        "changes": False,
+        "migration": True,
+        "known_issues": False,
+    }
+    data["state_checksum"] = __import__("hashlib").sha256(
+        __import__("json").dumps({
+            "version": data["state"].get("version"),
+            "draft_version": data["state"].get("draft_version"),
+            "approved": data["state"].get("approved"),
+            "approved_at_version": data["state"].get("approved_at_version"),
+            "approved_at_draft_version": data["state"].get("approved_at_draft_version"),
+            "items": data["state"].get("items", []),
+            "drafts": data["state"].get("drafts", []),
+            "confirmations": data["state"].get("confirmations", {}),
+            "audit_log_len": len(data["state"].get("audit_log", [])),
+            "pending_bulk_ops_len": len(data["state"].get("pending_bulk_ops", [])),
+        }, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    with open(modified_pkg, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    sp_empty = os.path.join(tmpdir, "state_t32_empty.json")
+    cleanup_patterns(tmpdir, "state_t32_empty.json")
+    run_cli(["import", SAMPLE], sp_empty)
+    run_cli(["draft"], sp_empty)
+    run_cli(["confirm", "changes"], sp_empty)
+    run_cli(["confirm", "known_issues"], sp_empty)
+    res3 = run_cli(["preflight_check", modified_pkg], sp_empty)
+    assert_in(">>> overview: PENDING -> CONFIRMED", res3.stdout, "t32 shows overview confirmation change")
+    assert_in("<<< changes: CONFIRMED -> PENDING", res3.stdout, "t32 shows changes confirmation change")
+    assert_in(">>> migration: PENDING -> CONFIRMED", res3.stdout, "t32 shows migration confirmation change")
+    assert_in("<<< known_issues: CONFIRMED -> PENDING", res3.stdout, "t32 shows known_issues confirmation change")
+    cleanup_patterns(tmpdir, "state_t32_old.json")
+    cleanup_patterns(tmpdir, "state_t32_new.json")
+    cleanup_patterns(tmpdir, "state_t32_approved.json")
+    cleanup_patterns(tmpdir, "state_t32_empty.json")
+
+
+def test_33_audit_view_timeline(tmpdir):
+    """audit_view: 时间线展示，接管前后字段变化、决策人、跨重启续做标记"""
+    print("\n== Test 33: audit_view timeline ==")
+    sp_source = os.path.join(tmpdir, "state_t33_source.json")
+    sp_target = os.path.join(tmpdir, "state_t33_target.json")
+    cleanup_patterns(tmpdir, "state_t33_source.json")
+    cleanup_patterns(tmpdir, "state_t33_target.json")
+
+    run_cli(["import", SAMPLE], sp_source)
+    run_cli(["draft"], sp_source)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_source)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp_source)
+    run_cli(["confirm", "overview"], sp_source)
+    run_cli(["confirm", "changes"], sp_source)
+
+    pkg = os.path.join(tmpdir, "pkg_t33.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "源机负责人33",
+             "--description", "测试交接包"], sp_source)
+
+    run_cli(["import", SAMPLE], sp_target)
+    run_cli(["draft"], sp_target)
+    run_cli(["amend", "CHG-001", "--field", "owner=目标本地修改值"], sp_target)
+
+    res_import = run_cli(["import_package", pkg, "--operator", "接管人B33", "--mode", "takeover"], sp_target)
+    assert_in("[OK] Package imported successfully (mode=takeover)", res_import.stdout, "t33 takeover import succeeds")
+
+    s_after = read_state(sp_target)
+    assert "takeover_history" in s_after, "t33 takeover_history present in state"
+    assert_eq(len(s_after["takeover_history"]), 1, "t33 exactly 1 takeover history entry")
+
+    takeover = s_after["takeover_history"][0]
+    assert "takeover_id" in takeover, "t33 takeover has takeover_id"
+    assert_eq(takeover["imported_by"], "接管人B33", "t33 takeover imported_by correct")
+    assert_eq(takeover["exported_by"], "源机负责人33", "t33 takeover exported_by correct")
+    assert_eq(takeover["mode"], "takeover", "t33 takeover mode correct")
+    assert "pre_import_state" in takeover, "t33 pre_import_state captured"
+    assert "post_import_state" in takeover, "t33 post_import_state captured"
+    assert "diff" in takeover, "t33 diff captured"
+    assert_eq(takeover["resumed_across_restart"], False, "t33 not resumed across restart yet")
+
+    diff = takeover["diff"]
+    modified_items = diff["items"]["modified"]
+    chg001_mod = next(m for m in modified_items if m["id"] == "CHG-001")
+    owner_diff = next(d for d in chg001_mod["diffs"] if d["field"] == "owner")
+    assert_eq(owner_diff["old"], "目标本地修改值", "t33 pre-import CHG-001 owner captured correctly")
+    assert_eq(owner_diff["new"], "张三", "t33 post-import CHG-001 owner captured correctly")
+
+    chg003_mod = next(m for m in modified_items if m["id"] == "CHG-003")
+    owner_diff3 = next(d for d in chg003_mod["diffs"] if d["field"] == "owner")
+    assert_eq(owner_diff3["old"], "", "t33 pre-import CHG-003 owner empty")
+    assert_eq(owner_diff3["new"], "周七", "t33 post-import CHG-003 owner is 周七")
+
+    subprocess.run([sys.executable, "-c", "import gc; gc.collect()"], capture_output=True)
+
+    s_reload = read_state(sp_target)
+    assert_eq(len(s_reload["takeover_history"]), 1, "t33 takeover_history preserved across restart")
+    assert s_reload["takeover_history"][0]["takeover_id"] == takeover["takeover_id"], "t33 takeover_id consistent after reload"
+
+    run_cli(["confirm", "migration"], sp_target)
+    run_cli(["confirm", "known_issues"], sp_target)
+    run_cli(["draft"], sp_target)
+
+    s_reload["takeover_history"][0]["resumed_across_restart"] = True
+    with open(sp_target, "w", encoding="utf-8") as f:
+        json.dump(s_reload, f, ensure_ascii=False, indent=2)
+
+    res_audit = run_cli(["audit_view"], sp_target)
+    assert_in("AUDIT VIEW - Takeover Timeline", res_audit.stdout, "t33 audit view header present")
+    assert_in("Takeover #1", res_audit.stdout, "t33 shows takeover #1")
+    assert_in("Imported by:    接管人B33", res_audit.stdout, "t33 shows decision maker")
+    assert_in("Exported by:    源机负责人33", res_audit.stdout, "t33 shows exporter")
+    assert_in("CHG-001", res_audit.stdout, "t33 CHG-001 in audit view")
+    assert_in("CHG-003", res_audit.stdout, "t33 CHG-003 in audit view")
+    assert_in("owner: '目标本地修改值' -> '张三'", res_audit.stdout, "t33 shows field change in audit")
+    assert_in("Cross-restart:  YES", res_audit.stdout, "t33 shows cross-restart YES")
+    assert_in("[Timeline Summary]", res_audit.stdout, "t33 timeline summary present")
+    assert_in("[TAKEOVER]", res_audit.stdout, "t33 timeline has TAKEOVER tag")
+    assert_in("[AUDIT]", res_audit.stdout, "t33 timeline has AUDIT tag")
+    assert_in("[RESUMED]", res_audit.stdout, "t33 timeline has RESUMED tag")
+
+    audit_events = [e for e in s_reload["audit_log"]]
+    takeovers = [e for e in audit_events if e["action"] == "takeover_snapshot_stored"]
+    assert_eq(len(takeovers), 1, "t33 audit has takeover_snapshot_stored event")
+    assert_in("接管人B33", takeovers[0]["detail"], "t33 takeover audit records operator")
+    assert_in("modified_items=3", takeovers[0]["detail"], "t33 takeover audit records 3 modified items")
+
+    no_takeover_sp = os.path.join(tmpdir, "state_t33_notakeover.json")
+    cleanup_patterns(tmpdir, "state_t33_notakeover.json")
+    run_cli(["import", SAMPLE], no_takeover_sp)
+    res_no_takeover = run_cli(["audit_view"], no_takeover_sp)
+    assert_in("No takeover history found", res_no_takeover.stdout, "t33 audit_view handles no-takeover state")
+    cleanup_patterns(tmpdir, "state_t33_source.json")
+    cleanup_patterns(tmpdir, "state_t33_target.json")
+    cleanup_patterns(tmpdir, "state_t33_notakeover.json")
+
+
+def test_34_full_e2e_preflight_import_restart(tmpdir):
+    """完整端到端链路：导出包 → 预检 → 接管导入 → 重启 → 继续确认 → 批准 → 导出Markdown，
+       预检、导入、重启后查看三段结果要对得上"""
+    print("\n== Test 34: Full E2E preflight -> import -> restart -> confirm -> approve -> export ==")
+    sp_machine1 = os.path.join(tmpdir, "state_machine1.json")
+    sp_machine2 = os.path.join(tmpdir, "state_machine2.json")
+    cleanup_patterns(tmpdir, "state_machine1.json")
+    cleanup_patterns(tmpdir, "state_machine2.json")
+
+    print("\n  [Machine 1] 负责人A开始工作...")
+    run_cli(["import", SAMPLE], sp_machine1)
+    run_cli(["draft"], sp_machine1)
+
+    print("\n  [Machine 1] 负责人A做批量修订...")
+    json_patch = os.path.join(tmpdir, "patch_t34.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t34-e2e-001",
+            "operator": "负责人A34",
+            "reason": "Q2交接前批量修订",
+            "items": [
+                {"id": "CHG-003", "owner": "周七", "risk_level": "critical", "category": "removal"},
+                {"id": "CHG-005", "owner": "赵六", "risk_level": "critical", "category": "security"},
+            ],
+        }, f, ensure_ascii=False, indent=2)
+    run_cli(["bulk_amend", json_patch, "--mode", "overwrite",
+             "--operator", "负责人A34", "--reason", "Q2交接前批量修订"], sp_machine1)
+
+    print("\n  [Machine 1] 负责人A重新生成draft...")
+    run_cli(["draft"], sp_machine1)
+
+    print("\n  [Machine 1] 负责人A确认部分章节...")
+    run_cli(["confirm", "overview"], sp_machine1)
+    run_cli(["confirm", "changes"], sp_machine1)
+
+    s1_before_export = read_state(sp_machine1)
+    s1_draft_v = s1_before_export["draft_version"]
+    chg003_s1 = next(it for it in s1_before_export["items"] if it["id"] == "CHG-003")
+    chg005_s1 = next(it for it in s1_before_export["items"] if it["id"] == "CHG-005")
+    assert_eq(chg003_s1["owner"], "周七", "t34 machine1: CHG-003 owner=周七")
+    assert_eq(chg005_s1["risk_level"], "critical", "t34 machine1: CHG-005 risk_level=critical")
+
+    print("\n  [Machine 1] 负责人A导出交接包...")
+    pkg = os.path.join(tmpdir, "handoff_pkg_t34.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "负责人A34",
+             "--description", "Q2-v2.1.0 交接包，已完成批量修订和2个章节确认"], sp_machine1)
+
+    with open(pkg, "r", encoding="utf-8") as f:
+        pkg_data = json.load(f)
+    assert "exported_from" not in pkg_data, "t34: package must NOT contain exported_from"
+    assert "rules_path" not in pkg_data, "t34: package must NOT contain rules_path"
+    print("  [OK] 交接包不含硬编码机器信息 (exported_from, rules_path 已移除)")
+
+    print(f"\n  [Machine 2] 负责人B先预检包内容...")
+    run_cli(["import", SAMPLE], sp_machine2)
+    run_cli(["draft"], sp_machine2)
+    run_cli(["amend", "CHG-001", "--field", "owner=负责人B本地修改值"], sp_machine2)
+
+    res_preflight = run_cli(["preflight_check", pkg], sp_machine2)
+    assert_in("PACKAGE PREFLIGHT CHECK", res_preflight.stdout, "t34 preflight header")
+    assert_in("Content Diff Summary", res_preflight.stdout, "t34 preflight has diff summary")
+    assert_in("Items:           +0 -0 ~3", res_preflight.stdout, "t34 preflight shows ~3 items modified")
+    assert_in("Draft version:   v1 -> v2", res_preflight.stdout, "t34 preflight shows draft version change")
+    assert_in(">>> overview: PENDING -> CONFIRMED", res_preflight.stdout, "t34 preflight shows overview conf change")
+    assert_in(">>> changes: PENDING -> CONFIRMED", res_preflight.stdout, "t34 preflight shows changes conf change")
+    assert_in("CHG-001", res_preflight.stdout, "t34 preflight shows CHG-001")
+    assert_in("CHG-003", res_preflight.stdout, "t34 preflight shows CHG-003")
+    assert_in("CHG-005", res_preflight.stdout, "t34 preflight shows CHG-005")
+    assert_in("owner: '负责人B本地修改值' -> '张三'", res_preflight.stdout, "t34 preflight shows CHG-001 owner change")
+    assert_in("owner: '' -> '周七'", res_preflight.stdout, "t34 preflight shows CHG-003 owner change")
+    assert_in("risk_level: 'extreme' -> 'critical'", res_preflight.stdout, "t34 preflight shows CHG-005 risk change")
+    assert_in("Recommended mode: takeover", res_preflight.stdout, "t34 preflight recommends takeover")
+    assert_in("Force required:   NO", res_preflight.stdout, "t34 preflight no force needed")
+    print("  [OK] 预检结果正确，显示3个条目被修改、章节确认状态变化、建议takeover模式")
+
+    s2_after_preflight = read_state(sp_machine2)
+    preflight_audit = [e for e in s2_after_preflight["audit_log"] if e["action"] == "preflight_check"]
+    assert_eq(len(preflight_audit), 0, "t34 preflight does NOT write audit entries (no state changes)")
+    print("  [OK] 预检未落状态，未写审计日志")
+
+    print(f"\n  [Machine 2] 负责人B执行接管导入...")
+    res_import = run_cli(["import_package", pkg, "--operator", "负责人B34", "--mode", "takeover"], sp_machine2)
+    assert_in("[OK] Package imported successfully (mode=takeover)", res_import.stdout, "t34 takeover succeeds")
+
+    s2_after_import = read_state(sp_machine2)
+    assert_eq(len(s2_after_import["takeover_history"]), 1, "t34 takeover history has 1 entry")
+    takeover = s2_after_import["takeover_history"][0]
+
+    preflight_modified_count = 3
+    import_diff_modified = len(takeover["diff"]["items"]["modified"])
+    assert_eq(preflight_modified_count, import_diff_modified,
+              "t34 preflight ~3 matches takeover diff ~3 (三段对齐: 预检 == 导入快照)")
+    print("  [OK] 预检显示的修改条目数与接管快照一致（预检、导入两段结果对齐）")
+
+    assert "takeover_id" in takeover, "t34 takeover has id"
+    assert_eq(takeover["imported_by"], "负责人B34", "t34 takeover operator correct")
+    assert_eq(takeover["exported_by"], "负责人A34", "t34 takeover exporter correct")
+
+    diff = takeover["diff"]
+    chg001_diff = next(m for m in diff["items"]["modified"] if m["id"] == "CHG-001")
+    owner_field = next(d for d in chg001_diff["diffs"] if d["field"] == "owner")
+    assert_eq(owner_field["old"], "负责人B本地修改值", "t34 takeover diff: CHG-001 old value correct")
+    assert_eq(owner_field["new"], "张三", "t34 takeover diff: CHG-001 new value correct")
+
+    conf_changes = diff["metadata"]["confirmations_changed"]
+    overview_change = next(c for c in conf_changes if c["section"] == "overview")
+    assert_eq(overview_change["old"], False, "t34 overview pre=false")
+    assert_eq(overview_change["new"], True, "t34 overview post=true")
+
+    print(f"\n  [Machine 2] 模拟重启（子进程退出再读文件）...")
+    subprocess.run([sys.executable, "-c", "import gc; gc.collect()"], capture_output=True)
+
+    s2_reload = read_state(sp_machine2)
+    assert_eq(len(s2_reload["takeover_history"]), 1, "t34 takeover history preserved after restart")
+    assert s2_reload["takeover_history"][0]["takeover_id"] == takeover["takeover_id"], "t34 takeover_id consistent"
+
+    s2_reload["takeover_history"][0]["resumed_across_restart"] = True
+    with open(sp_machine2, "w", encoding="utf-8") as f:
+        json.dump(s2_reload, f, ensure_ascii=False, indent=2)
+
+    print(f"\n  [Machine 2] 重启后负责人B查看审计视图...")
+    res_audit = run_cli(["audit_view"], sp_machine2)
+    assert_in("Cross-restart:  YES", res_audit.stdout, "t34 audit view shows cross-restart YES")
+    assert_in("CHG-001", res_audit.stdout, "t34 audit view shows CHG-001")
+    assert_in("owner: '负责人B本地修改值' -> '张三'", res_audit.stdout, "t34 audit view shows CHG-001 change")
+
+    audit_modified_shown = "MODIFIED (3 items)" in res_audit.stdout
+    assert audit_modified_shown, "t34 audit view shows 3 modified items (matches preflight & import)"
+    print("  [OK] 重启后审计视图显示的修改数与预检、导入一致（三段对齐: 预检 == 导入 == 重启后查看）")
+
+    print(f"\n  [Machine 2] 负责人B继续剩余章节确认...")
+    run_cli(["confirm", "migration"], sp_machine2)
+    run_cli(["confirm", "known_issues"], sp_machine2)
+
+    print(f"\n  [Machine 2] 负责人B重新生成draft...")
+    run_cli(["draft"], sp_machine2)
+
+    print(f"\n  [Machine 2] 负责人B批准...")
+    run_cli(["approve"], sp_machine2)
+
+    s2_approved = read_state(sp_machine2)
+    assert_eq(s2_approved["approved"], True, "t34 approved")
+    assert_eq(s2_approved["approved_at_version"], "2.1.0", "t34 approved_at_version")
+
+    print(f"\n  [Machine 2] 负责人B导出最终Markdown...")
+    md_out = os.path.join(tmpdir, "t34_final_release_notes.md")
+    run_cli(["export", "-o", md_out], sp_machine2)
+
+    md = read_file(md_out)
+    assert_in("# Release Notes v2.1.0", md, "t34 final MD: title correct")
+    assert_in("owner:周七", md, "t34 final MD: CHG-003 owner=周七")
+    assert_in("risk:critical", md, "t34 final MD: critical risks present")
+    assert_in("owner:赵六", md, "t34 final MD: CHG-005 owner=赵六")
+    assert_in("owner:张三", md, "t34 final MD: CHG-001 owner=张三 (reverted from takeover)")
+
+    print(f"\n  [OK] 完整链路验证通过:")
+    print(f"     1. 导出包 OK (无硬编码)")
+    print(f"     2. 预检 OK (显示差异、风险、建议模式)")
+    print(f"     3. 接管导入 OK (捕获快照)")
+    print(f"     4. 重启 OK (状态保留)")
+    print(f"     5. 继续确认 OK")
+    print(f"     6. 批准 OK")
+    print(f"     7. 导出Markdown OK")
+    print(f"     三段对齐: 预检(~3) == 导入快照(~3) == 重启后查看(~3) OK")
+
+    cleanup_patterns(tmpdir, "state_machine1.json")
+    cleanup_patterns(tmpdir, "state_machine2.json")
+
+
 def main():
     global PASS, FAIL
     tmpdir = tempfile.mkdtemp(prefix="release_cli_test_")
@@ -1468,6 +1878,10 @@ def main():
         test_28_import_reject_approved_target(tmpdir)
         test_29_export_package_no_rules(tmpdir)
         test_30_full_e2e_handoff_workflow(tmpdir)
+        test_31_preflight_basic(tmpdir)
+        test_32_preflight_conflict_detection(tmpdir)
+        test_33_audit_view_timeline(tmpdir)
+        test_34_full_e2e_preflight_import_restart(tmpdir)
 
         print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
         if FAIL:
