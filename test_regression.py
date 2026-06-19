@@ -858,6 +858,132 @@ def test_20_resume_abort_per_item(tmpdir):
     cleanup_patterns(tmpdir, "state_t20.json")
 
 
+def test_21_draft_version_alignment(tmpdir):
+    """Bug regression: Markdown 文末 Draft 版本号、state.draft_version、snapshot.version 必须严格对齐"""
+    print("\n== Test 21: Draft version alignment (Markdown <-> state <-> snapshot <-> history) ==")
+    sp = os.path.join(tmpdir, "state_t21.json")
+    cleanup_patterns(tmpdir, "state_t21.json")
+
+    run_cli(["import", SAMPLE], sp)
+
+    for expected_v in [1, 2, 3]:
+        out = os.path.join(tmpdir, f"t21_draft_v{expected_v}.md")
+        run_cli(["draft", "-o", out], sp)
+        md = read_file(out)
+        s = read_state(sp)
+        draft_events = [e for e in s["audit_log"] if e["action"] == "draft_generated"]
+        last_audit_v = None
+        if draft_events:
+            last_detail = draft_events[-1]["detail"]
+            import re as _re
+            m = _re.search(r"draft_v=(\d+)", last_detail)
+            if m:
+                last_audit_v = int(m.group(1))
+        assert_eq(s["draft_version"], expected_v,
+                  f"t21 state.draft_version == {expected_v} after {expected_v}th draft")
+        assert_in(f"Draft v{expected_v}_", md,
+                  f"t21 Markdown ends with Draft v{expected_v}")
+        snap = s["drafts"][-1]
+        assert_eq(snap["version"], expected_v,
+                  f"t21 drafts[-1].version == {expected_v} (snapshot aligns)")
+        if last_audit_v is not None:
+            assert_eq(last_audit_v, expected_v,
+                      f"t21 audit draft_v == {expected_v} (history aligns)")
+
+    json_patch = os.path.join(tmpdir, "patch_t21.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t21-bulk",
+            "operator": "t21-op",
+            "items": [{"id": "CHG-003", "owner": "周七"}]
+        }, f, ensure_ascii=False, indent=2)
+    run_cli(["bulk_amend", json_patch, "--mode", "skip", "--operator", "t21-op"], sp)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical", "--operator", "t21-op"], sp)
+
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+
+    v4out = os.path.join(tmpdir, "t21_draft_v4.md")
+    run_cli(["draft", "-o", v4out], sp)
+    s = read_state(sp)
+    md4 = read_file(v4out)
+    assert_eq(s["draft_version"], 4, "t21 draft_version == 4 after bulk amend + re-draft")
+    assert_in("Draft v4_", md4, "t21 post-bulk Markdown Draft v4")
+    assert_eq(s["drafts"][-1]["version"], 4, "t21 post-bulk snapshot.version == 4")
+
+    subprocess.run([sys.executable, "-c", "import gc; gc.collect()"], capture_output=True)
+
+    s_reload = read_state(sp)
+    assert_eq(s_reload["draft_version"], 4, "t21 after reload draft_version still 4")
+    run_cli(["approve"], sp)
+    export_out = os.path.join(tmpdir, "t21_final.md")
+    run_cli(["export", "-o", export_out], sp)
+    s_final = read_state(sp)
+    assert_eq(s_final["approved_at_draft_version"], 4,
+              "t21 approved_at_draft_version == 4 (matches last draft v4)")
+    cleanup_patterns(tmpdir, "state_t21.json")
+
+
+def test_22_resume_missing_evidence_aborts(tmpdir):
+    """Bug regression: resume 时决策证据（conflicts_snapshot）缺失 → 应中止，不得默认 apply 提交"""
+    print("\n== Test 22: Resume missing decision evidence MUST abort (no silent apply) ==")
+    sp = os.path.join(tmpdir, "state_t22.json")
+    cleanup_patterns(tmpdir, "state_t22.json")
+
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["amend", "CHG-001", "--field", "owner=先改了A", "--operator", "t22-prev"], sp)
+    run_cli(["draft"], sp)
+    run_cli(["confirm", "changes"], sp)
+
+    json_patch = os.path.join(tmpdir, "patch_t22.json")
+    with open(json_patch, "w", encoding="utf-8") as f:
+        json.dump({
+            "patch_id": "t22-ev",
+            "operator": "t22-init",
+            "items": [
+                {"id": "CHG-001", "owner": "冲突A"},
+                {"id": "CHG-002", "owner": "冲突B"},
+            ]
+        }, f, ensure_ascii=False, indent=2)
+
+    run_cli(["bulk_amend", json_patch, "--operator", "t22-init"], sp, expect_fail=True)
+
+    s = read_state(sp)
+    pending = s["pending_bulk_ops"][0]
+    original_conflicts = pending["conflicts_snapshot"]
+    assert_eq(len(original_conflicts), 2,
+              "t22 setup: CHG-001 and CHG-002 both conflict (section_confirmed or already_modified)")
+
+    chg002_before = next(it for it in s["items"] if it["id"] == "CHG-002")
+    orig_owner_002 = chg002_before["owner"]
+
+    pending["conflicts_snapshot"] = [
+        c for c in original_conflicts if not (c["target_type"] == "item" and c["id"] == "CHG-002")
+    ]
+    assert_eq(len(pending["conflicts_snapshot"]), 1,
+              "t22 simulate corruption: removed CHG-002 from conflicts_snapshot (evidence lost)")
+    with open(sp, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+
+    res = run_cli(["bulk_amend", "--resume", "0", "--decision", "overwrite",
+                   "--operator", "t22-resumer"], sp, expect_fail=True)
+    assert_in("missing decision evidence", (res.stdout or "").lower() + " " + (res.stderr or "").lower(),
+              "t22 resume aborts with 'missing decision evidence' when CHG-002 has no decision record")
+
+    s_after = read_state(sp)
+    chg002_after = next(it for it in s_after["items"] if it["id"] == "CHG-002")
+    assert_eq(chg002_after["owner"], orig_owner_002,
+              "t22 CHG-002 owner UNCHANGED after evidence-missing abort (not silently applied)")
+
+    pending_after = s_after["pending_bulk_ops"][0]
+    assert_eq(pending_after["resolved"], False,
+              "t22 pending remains unresolved (no spurious conclusion written)")
+    apply_events = [e for e in s_after["audit_log"] if e["action"] == "bulk_amend_applied"]
+    assert_eq(len(apply_events), 0,
+              "t22 no bulk_amend_applied event written on evidence-missing abort")
+    cleanup_patterns(tmpdir, "state_t22.json")
+
+
 def main():
     global PASS, FAIL
     tmpdir = tempfile.mkdtemp(prefix="release_cli_test_")
@@ -883,6 +1009,8 @@ def main():
         test_18_bulk_draft_newer_conflict(tmpdir)
         test_19_bulk_invalid_risk_rejected(tmpdir)
         test_20_resume_abort_per_item(tmpdir)
+        test_21_draft_version_alignment(tmpdir)
+        test_22_resume_missing_evidence_aborts(tmpdir)
 
         print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
         if FAIL:

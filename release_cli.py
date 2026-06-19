@@ -280,9 +280,9 @@ def cmd_draft(args, rules):
         print("[ERROR] No state found. Run 'import' first.")
         sys.exit(1)
 
-    md = _render_markdown(state)
     state["draft_version"] += 1
     dv = state["draft_version"]
+    md = _render_markdown(state)
 
     draft_snapshot = {
         "version": dv,
@@ -297,7 +297,7 @@ def cmd_draft(args, rules):
     }
     state["drafts"].append(draft_snapshot)
 
-    _audit(state, "draft", f"generated draft v{dv}")
+    _audit(state, "draft_generated", f"draft_v={dv} items={len(state['items'])} migs={len(state.get('migration_reminders', []))} kis={len(state.get('known_issues', []))}")
     save_state(state, state_path)
 
     out_path = args.output or os.path.join(SCRIPT_DIR, f"release_notes_v{state['version']}_draft{dv}.md")
@@ -927,6 +927,44 @@ def _detect_conflicts(state, patch):
     return conflicts
 
 
+def _collect_decision_required_keys(patch, conflicts, strict):
+    required = set()
+    if strict:
+        for e in patch.get("items", []):
+            if e.get("id"):
+                required.add(("item", e["id"]))
+        for e in patch.get("migration_reminders", []):
+            if e.get("id"):
+                required.add(("migration", e["id"]))
+        for e in patch.get("known_issues", []):
+            if e.get("id"):
+                required.add(("known_issue", e["id"]))
+    else:
+        hard_types = {"draft_newer", "already_modified", "section_confirmed"}
+        for c in conflicts:
+            if c.get("type") in hard_types:
+                required.add((c["target_type"], c["id"]))
+    return required
+
+
+def _enforce_decision_coverage(patch, conflicts, decisions, strict, operator, patch_id):
+    required = _collect_decision_required_keys(patch, conflicts, strict)
+    missing = []
+    for key in required:
+        if key not in decisions:
+            missing.append(key)
+    if not missing:
+        return None
+    missing_str = ", ".join(f"{k[0]}:{k[1]}" for k in sorted(missing))
+    mode_label = "resume (strict)" if strict else "non-interactive"
+    print(f"[ABORT] {mode_label} mode: missing decision evidence for {len(missing)} entries:")
+    print(f"        {missing_str}")
+    print(f"        The conflicts snapshot may have been lost or corrupted.")
+    print(f"        Refusing to write process conclusions without full audit evidence.")
+    sys.exit(4)
+    return missing_str
+
+
 def _invalidate_section_confirmations(state, patch):
     item_ids_in_patch = {e.get("id") for e in patch["items"] if e.get("id")}
     mig_ids_in_patch = {e.get("id") for e in patch.get("migration_reminders", []) if e.get("id")}
@@ -1135,6 +1173,11 @@ def cmd_bulk_amend(args, rules):
             else:
                 decisions_map[(c["target_type"], c["id"])] = "overwrite"
 
+    _enforce_decision_coverage(
+        patch, conflicts, decisions_map, strict=False,
+        operator=operator, patch_id=patch["patch_id"],
+    )
+
     applied_count = 0
     skipped_count = 0
     per_item_results = []
@@ -1263,6 +1306,11 @@ def _cmd_bulk_resume(args, rules, state):
             print(f"[ERROR] No decision for conflict [{c['type']}] {c['target_type']}:{c['id']}")
             print(f"        Use --decision skip|overwrite|abort and/or --per-item id=dec,id=dec")
             sys.exit(1)
+
+    _enforce_decision_coverage(
+        patch, conflicts, final_decisions, strict=True,
+        operator=operator, patch_id=patch["patch_id"],
+    )
 
     abort_all = any(d[0] == "abort" for d in final_decisions.values())
     if abort_all:
