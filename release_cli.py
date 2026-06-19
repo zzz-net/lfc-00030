@@ -2,15 +2,20 @@
 import argparse
 import copy
 import csv
+import getpass
+import hashlib
 import io
 import json
 import os
+import platform
 import sys
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RULES = os.path.join(SCRIPT_DIR, "rules.yaml")
 DEFAULT_STATE = os.path.join(SCRIPT_DIR, ".release_state.json")
+
+PACKAGE_FORMAT_VERSION = "1.0.0"
 
 try:
     import yaml
@@ -80,6 +85,311 @@ def _new_state(version, batch_id):
         "current_batch_id": batch_id,
         "pending_bulk_ops": [],
     }
+
+
+def _compute_state_checksum(state):
+    relevant = {
+        "version": state.get("version"),
+        "draft_version": state.get("draft_version"),
+        "approved": state.get("approved"),
+        "approved_at_version": state.get("approved_at_version"),
+        "approved_at_draft_version": state.get("approved_at_draft_version"),
+        "items": state.get("items", []),
+        "drafts": state.get("drafts", []),
+        "confirmations": state.get("confirmations", {}),
+        "audit_log_len": len(state.get("audit_log", [])),
+        "pending_bulk_ops_len": len(state.get("pending_bulk_ops", [])),
+    }
+    serialized = json.dumps(relevant, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _get_identity():
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "unknown"
+    return f"{user}@{platform.node()}"
+
+
+def _build_package(state, operator, rules_path, description):
+    rules_copy = None
+    if rules_path and os.path.exists(rules_path):
+        with open(rules_path, "r", encoding="utf-8") as f:
+            rules_copy = f.read()
+
+    package = {
+        "package_format_version": PACKAGE_FORMAT_VERSION,
+        "exported_at": datetime.now().isoformat(),
+        "exported_by": operator or _get_identity(),
+        "exported_from": platform.node(),
+        "description": description or "",
+        "state": copy.deepcopy(state),
+        "state_checksum": _compute_state_checksum(state),
+        "rules_path": rules_path,
+        "rules_snapshot": rules_copy,
+        "metadata": {
+            "version": state.get("version"),
+            "draft_version": state.get("draft_version"),
+            "approved": state.get("approved"),
+            "items_count": len(state.get("items", [])),
+            "batches": state.get("imported_batches", []),
+            "drafts_count": len(state.get("drafts", [])),
+            "audit_log_count": len(state.get("audit_log", [])),
+            "pending_bulk_ops_count": len(state.get("pending_bulk_ops", [])),
+            "unresolved_bulk_ops": len([p for p in state.get("pending_bulk_ops", []) if not p.get("resolved")]),
+        }
+    }
+    return package
+
+
+def _validate_package(package):
+    if not isinstance(package, dict):
+        return False, "Package is not a valid JSON object"
+    if "package_format_version" not in package:
+        return False, "Missing package_format_version"
+    if package["package_format_version"] != PACKAGE_FORMAT_VERSION:
+        return False, (f"Incompatible package format version: {package['package_format_version']} "
+                      f"(expected {PACKAGE_FORMAT_VERSION})")
+    if "state" not in package:
+        return False, "Package missing 'state' field"
+    if "state_checksum" not in package:
+        return False, "Package missing 'state_checksum' field"
+    expected = _compute_state_checksum(package["state"])
+    if expected != package["state_checksum"]:
+        return False, f"State checksum mismatch: package may be corrupted"
+    return True, "Package valid"
+
+
+def _compare_state_age(target_state, package_state):
+    target_dv = target_state.get("draft_version", 0)
+    package_dv = package_state.get("draft_version", 0)
+    target_audit = len(target_state.get("audit_log", []))
+    package_audit = len(package_state.get("audit_log", []))
+    target_approved = target_state.get("approved", False)
+    package_approved = package_state.get("approved", False)
+
+    target_modified = None
+    if target_state.get("audit_log"):
+        target_modified = target_state["audit_log"][-1].get("timestamp")
+    package_modified = None
+    if package_state.get("audit_log"):
+        package_modified = package_state["audit_log"][-1].get("timestamp")
+
+    target_score = (1 if target_approved else 0) * 1000 + target_dv * 10 + target_audit
+    package_score = (1 if package_approved else 0) * 1000 + package_dv * 10 + package_audit
+
+    return {
+        "target_newer": target_score > package_score,
+        "target_score": target_score,
+        "package_score": package_score,
+        "target_draft_version": target_dv,
+        "package_draft_version": package_dv,
+        "target_audit_len": target_audit,
+        "package_audit_len": package_audit,
+        "target_approved": target_approved,
+        "package_approved": package_approved,
+        "target_last_modified": target_modified,
+        "package_last_modified": package_modified,
+    }
+
+
+def cmd_export_package(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found. Run 'import' first.")
+        sys.exit(1)
+
+    operator = args.operator or _get_identity()
+    description = args.description or ""
+    include_rules = not args.no_rules
+
+    package = _build_package(state, operator, args.rules if include_rules else None, description)
+
+    out_path = args.output
+    if not out_path:
+        v = state.get("version", "UNKNOWN")
+        dv = state.get("draft_version", 0)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(SCRIPT_DIR, f"release_pkg_v{v}_d{dv}_{ts}.json")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(package, f, ensure_ascii=False, indent=2)
+
+    _audit(state, "export_package",
+           f"operator={operator} output={out_path} "
+           f"draft_v={state.get('draft_version')} items={len(state.get('items', []))} "
+           f"description={description}")
+    save_state(state, state_path)
+
+    print(f"[OK] Package exported -> {out_path}")
+    print(f"   Format version: {PACKAGE_FORMAT_VERSION}")
+    print(f"   Exported by:    {operator}")
+    print(f"   State:          v{state.get('version')} / draft v{state.get('draft_version')}")
+    print(f"   Items:          {len(state.get('items', []))}")
+    print(f"   Audit entries:  {len(state.get('audit_log', []))}")
+    if include_rules and package.get("rules_snapshot"):
+        print(f"   Rules snapshot: included")
+    else:
+        print(f"   Rules snapshot: excluded")
+
+
+def cmd_import_package(args, rules):
+    state_path = args.state
+    package_path = args.package
+
+    if not os.path.exists(package_path):
+        print(f"[ERROR] Package file not found: {package_path}")
+        sys.exit(1)
+
+    with open(package_path, "r", encoding="utf-8") as f:
+        package = json.load(f)
+
+    valid, msg = _validate_package(package)
+    if not valid:
+        print(f"[REJECTED] Package validation failed: {msg}")
+        sys.exit(1)
+
+    package_state = package["state"]
+    target_state = load_state(state_path)
+    operator = args.operator or _get_identity()
+    mode = args.mode or "merge"
+
+    print(f"\n== Import Package: '{package_path}' ==")
+    print(f"   Package format:  {package['package_format_version']}")
+    print(f"   Exported at:     {package.get('exported_at')}")
+    print(f"   Exported by:     {package.get('exported_by')}")
+    print(f"   Exported from:   {package.get('exported_from')}")
+    print(f"   Package state:   v{package_state.get('version')} / draft v{package_state.get('draft_version')}")
+    print(f"   Import mode:     {mode}")
+    print(f"   Imported by:     {operator}")
+    print()
+
+    if target_state is not None:
+        age_info = _compare_state_age(target_state, package_state)
+        print(f"Target state:      v{target_state.get('version')} / draft v{age_info['target_draft_version']}")
+        print(f"Package state:     v{package_state.get('version')} / draft v{age_info['package_draft_version']}")
+        print(f"Target audit len:  {age_info['target_audit_len']}")
+        print(f"Package audit len: {age_info['package_audit_len']}")
+        print(f"Target approved:   {age_info['target_approved']}")
+        print(f"Package approved:  {age_info['package_approved']}")
+        print()
+
+        if target_state.get("approved") and not args.force:
+            print("[REJECTED] Target state is already approved.")
+            print("   Use --force to override.")
+            if target_state is not None:
+                _audit(target_state, "import_package_rejected",
+                       f"operator={operator} package={package_path} reason=target_approved")
+                save_state(target_state, state_path)
+            sys.exit(1)
+
+        if age_info["target_newer"] and not args.force:
+            print("[REJECTED] Target state is NEWER than package state.")
+            print("   Importing would overwrite newer changes.")
+            print("   Use --force to override, or consider:")
+            print("     --mode merge    Continue from package state, merging history")
+            print("     --mode takeover Completely replace target state with package")
+            print()
+            if target_state is not None:
+                _audit(target_state, "import_package_rejected",
+                       f"operator={operator} package={package_path} "
+                       f"reason=target_newer target_score={age_info['target_score']} "
+                       f"package_score={age_info['package_score']}")
+                save_state(target_state, state_path)
+            sys.exit(1)
+
+    if mode == "takeover":
+        if target_state is not None:
+            _audit(package_state, "import_package_takeover",
+                   f"operator={operator} package={package_path} "
+                   f"exported_by={package.get('exported_by')} "
+                   f"exported_at={package.get('exported_at')} "
+                   f"old_version={target_state.get('version')} "
+                   f"old_draft_v={target_state.get('draft_version')} "
+                   f"new_version={package_state.get('version')} "
+                   f"new_draft_v={package_state.get('draft_version')} "
+                   f"force={args.force}")
+        else:
+            _audit(package_state, "import_package_takeover",
+                   f"operator={operator} package={package_path} "
+                   f"exported_by={package.get('exported_by')} "
+                   f"exported_at={package.get('exported_at')} "
+                   f"new_version={package_state.get('version')} "
+                   f"new_draft_v={package_state.get('draft_version')} "
+                   f"force={args.force}")
+        final_state = package_state
+
+    elif mode == "merge":
+        if target_state is None:
+            _audit(package_state, "import_package_merge",
+                   f"operator={operator} package={package_path} "
+                   f"exported_by={package.get('exported_by')} "
+                   f"exported_at={package.get('exported_at')} "
+                   f"note=no_target_creating_new "
+                   f"version={package_state.get('version')} "
+                   f"draft_v={package_state.get('draft_version')}")
+            final_state = package_state
+        else:
+            merged = copy.deepcopy(package_state)
+            merged["audit_log"] = target_state.get("audit_log", []) + [
+                {"timestamp": datetime.now().isoformat(),
+                 "action": "import_package_merge",
+                 "detail": (f"operator={operator} package={package_path} "
+                            f"exported_by={package.get('exported_by')} "
+                            f"exported_at={package.get('exported_at')} "
+                            f"target_audit_len={len(target_state.get('audit_log', []))} "
+                            f"package_audit_len={len(package_state.get('audit_log', []))} "
+                            f"force={args.force}")}
+            ] + package_state.get("audit_log", [])
+
+            if args.keep_target_batches:
+                target_batches = set(target_state.get("imported_batches", []))
+                package_batches = package_state.get("imported_batches", [])
+                merged["imported_batches"] = list(target_batches) + [
+                    b for b in package_batches if b not in target_batches
+                ]
+
+            _audit(merged, "import_package_merge",
+                   f"operator={operator} package={package_path} "
+                   f"exported_by={package.get('exported_by')} "
+                   f"exported_at={package.get('exported_at')} "
+                   f"keep_target_batches={args.keep_target_batches} "
+                   f"force={args.force}")
+            final_state = merged
+    else:
+        print(f"[ERROR] Unknown mode '{mode}'. Valid: merge, takeover")
+        sys.exit(1)
+
+    if package.get("rules_snapshot") and args.apply_rules_snapshot:
+        rules_dir = os.path.dirname(args.rules)
+        if not os.path.exists(rules_dir):
+            os.makedirs(rules_dir, exist_ok=True)
+        with open(args.rules, "w", encoding="utf-8") as f:
+            f.write(package["rules_snapshot"])
+        print(f"[INFO] Rules snapshot restored to {args.rules}")
+        _audit(final_state, "rules_restored",
+               f"from_package={package_path} operator={operator}")
+
+    save_state(final_state, state_path)
+
+    print()
+    print(f"[OK] Package imported successfully (mode={mode}).")
+    print(f"   Final state:  v{final_state.get('version')} / draft v{final_state.get('draft_version')}")
+    print(f"   Items:        {len(final_state.get('items', []))}")
+    print(f"   Audit log:    {len(final_state.get('audit_log', []))} entries")
+    if final_state.get("pending_bulk_ops"):
+        unresolved = len([p for p in final_state["pending_bulk_ops"] if not p.get("resolved")])
+        print(f"   Pending bulk: {unresolved} unresolved / {len(final_state['pending_bulk_ops'])} total")
+    print()
+    print(f"   Next steps:")
+    print(f"     release_cli.py --state {state_path} status")
+    print(f"     release_cli.py --state {state_path} history")
+    if final_state.get("pending_bulk_ops"):
+        unresolved_indices = [i for i, p in enumerate(final_state["pending_bulk_ops"]) if not p.get("resolved")]
+        for idx in unresolved_indices:
+            print(f"     release_cli.py --state {state_path} bulk_amend --resume {idx} --decision overwrite")
 
 
 def _ensure_item_versioning(item, operator="system"):
@@ -1465,6 +1775,25 @@ def main():
     sub.add_parser("status", help="Show current status")
     sub.add_parser("history", help="Show audit history")
 
+    p_export_pkg = sub.add_parser("export_package", help="Export full revision package for handoff")
+    p_export_pkg.add_argument("-o", "--output", help="Output package file path (.json)")
+    p_export_pkg.add_argument("--operator", help="Operator identifier (for audit)")
+    p_export_pkg.add_argument("--description", help="Description of this package snapshot")
+    p_export_pkg.add_argument("--no-rules", action="store_true",
+                              help="Exclude rules.yaml snapshot from package")
+
+    p_import_pkg = sub.add_parser("import_package", help="Import revision package from handoff")
+    p_import_pkg.add_argument("package", help="Path to package .json file")
+    p_import_pkg.add_argument("--operator", help="Operator identifier (for audit)")
+    p_import_pkg.add_argument("--mode", choices=["merge", "takeover"], default="merge",
+                              help="Import mode: merge (continue, preserve target history) or takeover (replace entire state)")
+    p_import_pkg.add_argument("--force", action="store_true",
+                              help="Force import even if target is newer or already approved")
+    p_import_pkg.add_argument("--keep-target-batches", action="store_true",
+                              help="In merge mode, keep target's imported_batches in addition to package's")
+    p_import_pkg.add_argument("--apply-rules-snapshot", action="store_true",
+                              help="Apply rules snapshot from package to local rules.yaml")
+
     args = parser.parse_args()
     rules = load_rules(args.rules)
 
@@ -1480,6 +1809,8 @@ def main():
         "export": cmd_export,
         "status": cmd_status,
         "history": cmd_history,
+        "export_package": cmd_export_package,
+        "import_package": cmd_import_package,
     }
 
     fn = dispatch.get(args.command)
