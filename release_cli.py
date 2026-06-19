@@ -763,6 +763,7 @@ def cmd_import_package(args, rules):
             ).hexdigest()[:16],
             "imported_at": datetime.now().isoformat(),
             "imported_by": operator,
+            "import_pid": os.getpid(),
             "exported_by": package.get("exported_by"),
             "exported_at": package.get("exported_at"),
             "package_path": os.path.basename(package_path),
@@ -787,6 +788,7 @@ def cmd_import_package(args, rules):
             ).hexdigest()[:16],
             "imported_at": datetime.now().isoformat(),
             "imported_by": operator,
+            "import_pid": os.getpid(),
             "exported_by": package.get("exported_by"),
             "exported_at": package.get("exported_at"),
             "package_path": os.path.basename(package_path),
@@ -1388,6 +1390,20 @@ def cmd_audit_view(args, rules):
         print("[INFO] No takeover history found.")
         print("  (This state was never imported via import_package mode=takeover)")
         return
+
+    current_pid = os.getpid()
+    state_updated = False
+    for takeover in takeover_history:
+        if not takeover.get("resumed_across_restart", False):
+            import_pid = takeover.get("import_pid")
+            if import_pid is not None and import_pid != current_pid:
+                takeover["resumed_across_restart"] = True
+                state_updated = True
+                _audit(state, "takeover_resumed_across_restart",
+                       f"takeover_id={takeover['takeover_id']} "
+                       f"import_pid={import_pid} current_pid={current_pid}")
+    if state_updated:
+        save_state(state, state_path)
 
     print("\n" + "=" * 70)
     print("AUDIT VIEW - Takeover Timeline")

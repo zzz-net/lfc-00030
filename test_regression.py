@@ -1843,6 +1843,166 @@ def test_34_full_e2e_preflight_import_restart(tmpdir):
     cleanup_patterns(tmpdir, "state_machine2.json")
 
 
+def test_35_cross_restart_resume_detection(tmpdir):
+    """跨重启续做识别：完整链路验证，确保接管后重启能自动识别为跨进程续做"""
+    print("\n== Test 35: Cross-restart resume detection (full E2E) ==")
+    sp_a = os.path.join(tmpdir, "state_t35_machineA.json")
+    sp_b = os.path.join(tmpdir, "state_t35_machineB.json")
+    cleanup_patterns(tmpdir, "state_t35_machineA.json")
+    cleanup_patterns(tmpdir, "state_t35_machineB.json")
+
+    print(f"\n  [Machine A] 导出交接包...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli(["draft"], sp_a)
+    run_cli(["amend", "CHG-001", "--field", "owner=张三"], sp_a)
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_a)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp_a)
+    run_cli(["draft"], sp_a)
+    run_cli(["confirm", "overview"], sp_a)
+    run_cli(["confirm", "changes"], sp_a)
+
+    pkg = os.path.join(tmpdir, "handoff_pkg_t35.json")
+    run_cli(["export_package", "-o", pkg, "--operator", "负责人A35",
+             "--description", "Q2-v2.1.0 交接包"], sp_a)
+
+    s_a = read_state(sp_a)
+    pkg_data = json.load(open(pkg, encoding="utf-8"))
+    assert "exported_from" not in pkg_data, "t35: package must NOT contain exported_from"
+    assert "rules_path" not in pkg_data, "t35: package must NOT contain rules_path"
+    print("  [OK] 交接包不含硬编码机器信息")
+
+    print(f"\n  [Machine B] 先预检包内容（同进程，模拟首次接管）...")
+    run_cli(["import", SAMPLE], sp_b)
+    run_cli(["draft"], sp_b)
+    run_cli(["amend", "CHG-001", "--field", "owner=负责人B本地修改值"], sp_b)
+
+    res_preflight = run_cli(["preflight_check", pkg], sp_b)
+    assert_in("Items:           +0 -0 ~3", res_preflight.stdout, "t35 preflight shows ~3 items")
+    assert_in(">>> overview: PENDING -> CONFIRMED", res_preflight.stdout, "t35 preflight shows overview conf change")
+    assert_in(">>> changes: PENDING -> CONFIRMED", res_preflight.stdout, "t35 preflight shows changes conf change")
+    assert_in("Recommended mode: takeover", res_preflight.stdout, "t35 preflight recommends takeover")
+    print("  [OK] 预检结果正确，显示3个修改条目、2个章节确认变化")
+
+    s_b_before = read_state(sp_b)
+    preflight_audit = [e for e in s_b_before["audit_log"] if e["action"] == "preflight_check"]
+    assert_eq(len(preflight_audit), 0, "t35 preflight does NOT write audit entries")
+
+    print(f"\n  [Machine B] 执行接管导入...")
+    res_import = run_cli(["import_package", pkg, "--operator", "负责人B35", "--mode", "takeover"], sp_b)
+    assert_in("[OK] Package imported successfully (mode=takeover)", res_import.stdout, "t35 import succeeds")
+
+    s_b_after = read_state(sp_b)
+    assert_eq(len(s_b_after["takeover_history"]), 1, "t35 takeover history has 1 entry")
+    takeover = s_b_after["takeover_history"][0]
+    assert "import_pid" in takeover, "t35 takeover snapshot has import_pid"
+    assert_eq(takeover["imported_by"], "负责人B35", "t35 takeover operator correct")
+    assert_eq(takeover["resumed_across_restart"], False, "t35: right after import, NOT cross-restart yet")
+
+    import_diff_count = len(takeover["diff"]["items"]["modified"])
+    assert_eq(import_diff_count, 3, "t35 takeover diff has 3 modified items")
+    print(f"  [OK] 接管导入成功，import_pid={takeover['import_pid']}，快照捕获3个修改条目")
+
+    print(f"\n  [Machine B] 继续完成剩余工作（同进程）...")
+    run_cli(["confirm", "migration"], sp_b)
+    run_cli(["confirm", "known_issues"], sp_b)
+    run_cli(["draft"], sp_b)
+    run_cli(["approve"], sp_b)
+
+    md_path = os.path.join(tmpdir, "t35_final_before_restart.md")
+    run_cli(["export", "-o", md_path], sp_b)
+    with open(md_path, "r", encoding="utf-8") as f:
+        md_before = f.read()
+    assert_in("CHG-003", md_before, "t35 MD before restart has CHG-003")
+    assert_in("周七", md_before, "t35 MD before restart has 周七")
+    assert_in("CHG-005", md_before, "t35 MD before restart has CHG-005")
+    assert_in("critical", md_before, "t35 MD before restart has critical")
+    print("  [OK] 批准并导出 Markdown 成功，内容正确")
+
+    print(f"\n  [模拟重启] 启动新 Python 子进程查看 audit_view（不同 PID）...")
+    import subprocess
+    audit_script = os.path.join(tmpdir, "run_audit.py")
+    with open(audit_script, "w", encoding="utf-8") as f:
+        f.write(f"""
+import sys
+sys.path.insert(0, r"{os.path.dirname(os.path.abspath(__file__))}")
+from release_cli import main as cli_main
+sys.argv = ["release_cli.py", "--state", r"{sp_b}", "audit_view"]
+cli_main()
+""")
+    result = subprocess.run(
+        [sys.executable, audit_script],
+        capture_output=True
+    )
+    audit_output = result.stdout.decode('utf-8', errors='ignore') + result.stderr.decode('utf-8', errors='ignore')
+
+    print(f"\n  [验证] 重启后 audit_view 输出...")
+    assert_in("Cross-restart:  YES", audit_output, "t35: after restart, shows Cross-restart YES")
+    assert_in("~ MODIFIED (3 items):", audit_output, "t35: after restart, shows 3 modified items")
+    assert_in("CHG-001", audit_output, "t35: after restart, shows CHG-001 in diff")
+    assert_in("owner:", audit_output, "t35: after restart, shows field changes")
+    assert_in("->", audit_output, "t35: after restart, shows old -> new format")
+    assert_in(">>> overview: PENDING -> CONFIRMED", audit_output, "t35: after restart, shows conf changes")
+    assert_in(">>> changes: PENDING -> CONFIRMED", audit_output, "t35: after restart, shows conf changes")
+    assert_in("[RESUMED]", audit_output, "t35: timeline has [RESUMED] tag")
+    print("  [OK] 重启后 audit_view 正确显示跨重启续做标记、修改条目、确认状态变化")
+
+    print(f"\n  [验证] 重启后状态文件内容...")
+    s_b_restarted = read_state(sp_b)
+    takeover_restarted = s_b_restarted["takeover_history"][0]
+    assert_eq(takeover_restarted["resumed_across_restart"], True,
+              "t35: state file updated, resumed_across_restart=True")
+
+    audit_events = [e for e in s_b_restarted["audit_log"] if e["action"] == "takeover_resumed_across_restart"]
+    assert_eq(len(audit_events), 1, "t35: audit log has takeover_resumed_across_restart event")
+    assert_in(takeover["takeover_id"], audit_events[0]["detail"], "t35: audit event references correct takeover_id")
+
+    preflight_count = 3
+    takeover_diff_count = len(takeover_restarted["diff"]["items"]["modified"])
+    assert_eq(preflight_count, takeover_diff_count,
+              "t35: 预检 ~3 == 导入快照 ~3 == 重启后查看 ~3 (三段对齐)")
+    print("  [OK] 状态文件已更新：resumed_across_restart=True，audit 有续做事件，三段对齐")
+
+    print(f"\n  [验证] 重启后重新导出 Markdown，关键内容与重启前一致...")
+    md_path2 = os.path.join(tmpdir, "t35_final_after_restart.md")
+    run_cli(["export", "-o", md_path2], sp_b)
+    with open(md_path2, "r", encoding="utf-8") as f:
+        md_after = f.read()
+
+    def strip_timestamp(md):
+        lines = md.split('\n')
+        return '\n'.join([l for l in lines if not l.startswith('_Generated at')])
+
+    assert_eq(strip_timestamp(md_before), strip_timestamp(md_after),
+              "t35: MD content identical (excluding timestamp) before and after restart")
+    assert_in("CHG-003", md_after, "t35: MD after restart has CHG-003")
+    assert_in("周七", md_after, "t35: MD after restart has 周七")
+    assert_in("CHG-005", md_after, "t35: MD after restart has CHG-005")
+    assert_in("critical", md_after, "t35: MD after restart has critical")
+    print("  [OK] 重启前后导出的 Markdown 关键内容一致，状态稳定性验证通过")
+
+    print(f"\n  [验证] 再次运行 audit_view（同进程），不会重复写入审计...")
+    res_audit2 = run_cli(["audit_view"], sp_b)
+    assert_in("Cross-restart:  YES", res_audit2.stdout, "t35: second audit_view still shows YES")
+    s_b_final = read_state(sp_b)
+    resume_events = [e for e in s_b_final["audit_log"] if e["action"] == "takeover_resumed_across_restart"]
+    assert_eq(len(resume_events), 1, "t35: no duplicate resume events written")
+    print("  [OK] 多次运行 audit_view 不会重复产生审计事件")
+
+    print(f"\n  [OK] 完整链路验证通过:")
+    print(f"     1. 导出包 OK")
+    print(f"     2. 预检 OK (~3 items)")
+    print(f"     3. 接管导入 OK (import_pid 记录)")
+    print(f"     4. 继续确认 + 批准 + 导出 OK")
+    print(f"     5. 重启后 audit_view OK (自动识别 Cross-restart: YES)")
+    print(f"     6. 状态文件 OK (resumed_across_restart=True)")
+    print(f"     7. 审计日志 OK (takeover_resumed_across_restart 事件)")
+    print(f"     8. 三段对齐 OK (预检 ~3 == 导入 ~3 == 重启后 ~3)")
+    print(f"     9. 幂等性 OK (多次 audit_view 不重复写入)")
+
+    cleanup_patterns(tmpdir, "state_t35_machineA.json")
+    cleanup_patterns(tmpdir, "state_t35_machineB.json")
+
+
 def main():
     global PASS, FAIL
     tmpdir = tempfile.mkdtemp(prefix="release_cli_test_")
@@ -1882,6 +2042,7 @@ def main():
         test_32_preflight_conflict_detection(tmpdir)
         test_33_audit_view_timeline(tmpdir)
         test_34_full_e2e_preflight_import_restart(tmpdir)
+        test_35_cross_restart_resume_detection(tmpdir)
 
         print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
         if FAIL:
