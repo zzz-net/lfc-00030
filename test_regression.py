@@ -19,10 +19,8 @@ FAIL = 0
 
 def run_cli(args, state_path, expect_fail=False):
     cmd = [sys.executable, CLI, "--rules", RULES, "--state", state_path] + args
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8:replace"
     res = subprocess.run(cmd, capture_output=True, text=True,
-                         encoding="utf-8", errors="replace", cwd=SCRIPT_DIR, env=env)
+                         encoding="utf-8", errors="replace", cwd=SCRIPT_DIR)
     ok = res.returncode != 0 if expect_fail else res.returncode == 0
     if not ok:
         safe_print(f"  [FAIL] {' '.join(args)}")
