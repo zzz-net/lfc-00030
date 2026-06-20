@@ -1832,7 +1832,7 @@ def test_33_audit_view_timeline(tmpdir):
         json.dump(s_reload, f, ensure_ascii=False, indent=2)
 
     res_audit = run_cli(["audit_view"], sp_target)
-    assert_in("AUDIT VIEW - Takeover Timeline", res_audit.stdout, "t33 audit view header present")
+    assert_in("AUDIT VIEW - Takeover & Rules Upgrade Handover Timeline", res_audit.stdout, "t33 audit view header present")
     assert_in("Takeover #1", res_audit.stdout, "t33 shows takeover #1")
     assert_in("Confirmed by: 接管人B33", res_audit.stdout, "t33 shows confirmed by decision maker")
     assert_in("Exported by:    源机负责人33", res_audit.stdout, "t33 shows exporter")
@@ -1856,7 +1856,7 @@ def test_33_audit_view_timeline(tmpdir):
     cleanup_patterns(tmpdir, "state_t33_notakeover.json")
     run_cli(["import", SAMPLE], no_takeover_sp)
     res_no_takeover = run_cli(["audit_view"], no_takeover_sp)
-    assert_in("No takeover history found", res_no_takeover.stdout, "t33 audit_view handles no-takeover state")
+    assert_in("No takeover or rules upgrade handover history found", res_no_takeover.stdout, "t33 audit_view handles no-takeover state")
     cleanup_patterns(tmpdir, "state_t33_source.json")
     cleanup_patterns(tmpdir, "state_t33_target.json")
     cleanup_patterns(tmpdir, "state_t33_notakeover.json")
@@ -3685,6 +3685,563 @@ cli_main()
     cleanup_patterns(tmpdir, "state_t50_b.json")
 
 
+def test_51_rules_upgrade_handover_export_pending(tmpdir):
+    """规则升级交接包：从待决升级导出交接包，包结构、校验和、决策上下文完整"""
+    print("\n== Test 51: Rules upgrade handover export (pending upgrade) ==")
+    sp = os.path.join(tmpdir, "state_t51.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t51.json")
+
+    print("\n  [Step 1] 导入、做些修改、创建待决升级...")
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["amend", "CHG-001", "--field", "owner=张三"], sp)
+    run_cli(["confirm", "overview"], sp)
+
+    run_cli_with_rules(["rules_upgrade_check"], sp, stricter_rules)
+
+    s_before = read_state(sp)
+    pending = s_before["pending_rules_upgrade"]
+    upgrade_id = pending["upgrade_id"]
+    safe_print(f"  待决升级 ID: {upgrade_id}")
+    safe_print(f"  待决升级状态: {pending['status']}")
+
+    print("\n  [Step 2] 导出规则升级交接包...")
+    pkg = os.path.join(tmpdir, "ru_handover_t51.json")
+    res_export = run_cli_with_rules(
+        ["export_rules_upgrade_package", "-o", pkg,
+         "--operator", "用户A-51", "--note", "待决升级交接，等领导决策后再应用"],
+        sp, stricter_rules
+    )
+    assert_in("RULES UPGRADE HANDOVER PACKAGE EXPORTED", res_export.stdout,
+              "t51: 导出成功提示")
+    assert_in("Package checksum:", res_export.stdout, "t51: 显示校验和")
+
+    print("\n  [Step 3] 验证交接包结构...")
+    with open(pkg, "r", encoding="utf-8") as f:
+        pkg_data = json.load(f)
+
+    assert_eq(pkg_data["package_format_version"], "1.0.0", "t51: package_format_version == 1.0.0")
+    assert_eq(pkg_data["exported_by"], "用户A-51", "t51: exported_by 正确")
+    assert_eq(pkg_data["note"], "待决升级交接，等领导决策后再应用", "t51: note 正确")
+    assert_eq(pkg_data["upgrade_id"], upgrade_id, "t51: upgrade_id 与待决升级一致")
+    assert_eq(pkg_data["source_type"], "pending", "t51: source_type == pending")
+    assert_in("source_upgrade_snapshot", pkg_data, "t51: 包含 source_upgrade_snapshot")
+    assert_in("old_rules_version", pkg_data, "t51: 包含 old_rules_version")
+    assert_in("new_rules_version", pkg_data, "t51: 包含 new_rules_version")
+    assert_in("rules_diff", pkg_data, "t51: 包含 rules_diff")
+    assert_in("impact", pkg_data, "t51: 包含 impact 分析")
+    assert_in("decisions", pkg_data, "t51: 包含 decisions")
+    assert_in("decisions_log", pkg_data, "t51: 包含 decisions_log")
+    assert_in("pre_upgrade_items_snapshot", pkg_data, "t51: 包含 pre_upgrade_items_snapshot")
+    assert_in("current_rules_snapshot", pkg_data, "t51: 包含 current_rules_snapshot")
+    assert_in("package_checksum", pkg_data, "t51: 包含 package_checksum")
+
+    print("\n  [Step 4] 验证审计日志...")
+    s_after = read_state(sp)
+    audit_actions = [e["action"] for e in s_after["audit_log"]]
+    assert_in("rules_upgrade_package_exported", audit_actions, "t51: 审计日志包含导出事件")
+
+    export_event = [e for e in s_after["audit_log"] if e["action"] == "rules_upgrade_package_exported"][0]
+    assert_in(upgrade_id, export_event["detail"], "t51: 审计事件包含 upgrade_id")
+    assert_in("用户A-51", export_event["detail"], "t51: 审计事件包含操作人")
+
+    print("\n  [OK] 规则升级交接包导出（待决升级）功能正常")
+    cleanup_patterns(tmpdir, "state_t51.json")
+
+
+def test_52_rules_upgrade_handover_export_applied(tmpdir):
+    """规则升级交接包：从已应用升级导出交接包"""
+    print("\n== Test 52: Rules upgrade handover export (applied upgrade) ==")
+    sp = os.path.join(tmpdir, "state_t52.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t52.json")
+
+    print("\n  [Step 1] 导入、创建待决升级、应用升级...")
+    run_cli(["import", SAMPLE], sp)
+    run_cli_with_rules(["rules_upgrade_check"], sp, stricter_rules)
+    run_cli_with_rules(
+        ["rules_upgrade_apply",
+         "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor",
+         "--operator", "用户A-52"],
+        sp, stricter_rules
+    )
+
+    s_before = read_state(sp)
+    hist = s_before["rules_upgrade_history"]
+    assert len(hist) == 1, "t52: 应有 1 条已应用升级"
+    upgrade_id = hist[0]["upgrade_id"]
+    safe_print(f"  已应用升级 ID: {upgrade_id}")
+
+    print("\n  [Step 2] 从已应用升级导出交接包...")
+    pkg = os.path.join(tmpdir, "ru_handover_t52.json")
+    res_export = run_cli_with_rules(
+        ["export_rules_upgrade_package", "-o", pkg,
+         "--operator", "用户A-52", "--upgrade-source", upgrade_id,
+         "--note", "已应用升级交接"],
+        sp, stricter_rules
+    )
+    assert_in("RULES UPGRADE HANDOVER PACKAGE EXPORTED", res_export.stdout,
+              "t52: 导出成功提示")
+
+    print("\n  [Step 3] 验证交接包结构...")
+    with open(pkg, "r", encoding="utf-8") as f:
+        pkg_data = json.load(f)
+
+    assert_eq(pkg_data["upgrade_id"], upgrade_id, "t52: upgrade_id 与已应用升级一致")
+    assert_eq(pkg_data["source_type"], "applied", "t52: source_type == applied")
+
+    print("\n  [OK] 规则升级交接包导出（已应用升级）功能正常")
+    cleanup_patterns(tmpdir, "state_t52.json")
+
+
+def test_53_rules_upgrade_handover_import_conflict(tmpdir):
+    """规则升级交接包：导入时冲突检测 - 本地规则版本不同"""
+    print("\n== Test 53: Rules upgrade handover import conflict detection ==")
+    sp_a = os.path.join(tmpdir, "state_t53_a.json")
+    sp_b = os.path.join(tmpdir, "state_t53_b.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    newer_rules = os.path.join(tmpdir, "rules_newer.yaml")
+    _make_rules_stricter(stricter_rules)
+    _make_rules_newer(newer_rules)
+    cleanup_patterns(tmpdir, "state_t53_a.json")
+    cleanup_patterns(tmpdir, "state_t53_b.json")
+
+    print("\n  [Machine A] 导入、检查升级、导出交接包...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+
+    pkg = os.path.join(tmpdir, "ru_handover_t53.json")
+    run_cli_with_rules(
+        ["export_rules_upgrade_package", "-o", pkg, "--operator", "用户A-53"],
+        sp_a, stricter_rules
+    )
+
+    print("\n  [Machine B] 用不同规则初始化（模拟本地规则已变化）...")
+    run_cli(["import", SAMPLE], sp_b)
+    run_cli_with_rules(["rules_upgrade_check"], sp_b, newer_rules)
+    run_cli_with_rules(
+        ["rules_upgrade_apply",
+         "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor,CHG-003.test_coverage=80",
+         "--operator", "用户B-53"],
+        sp_b, newer_rules
+    )
+
+    print("\n  [Machine B] 尝试导入交接包（应检测到冲突）...")
+    res_import = run_cli_with_rules(
+        ["import_rules_upgrade_package", pkg, "--operator", "用户B-53"],
+        sp_b, newer_rules
+    )
+
+    assert_in("CONFLICTS DETECTED", res_import.stdout, "t53: 应检测到冲突")
+    conflict_found = "rules_version_mismatch" in res_import.stdout or "item_state_diverged" in res_import.stdout
+    assert conflict_found, "t53: 应检测到 rules_version_mismatch 或 item_state_diverged 冲突"
+    assert_in("AWAITING CONFIRMATION", res_import.stdout, "t53: 状态为待确认")
+
+    s_pending = read_state(sp_b)
+    assert s_pending.get("pending_rules_upgrade_import") is not None, "t53: 创建了 pending_rules_upgrade_import"
+    pending_imp = s_pending["pending_rules_upgrade_import"]
+    assert len(pending_imp.get("conflicts", [])) >= 1, "t53: 至少检测到 1 个冲突"
+
+    print("\n  [OK] 规则升级交接包冲突检测功能正常")
+    cleanup_patterns(tmpdir, "state_t53_a.json")
+    cleanup_patterns(tmpdir, "state_t53_b.json")
+
+
+def test_54_rules_upgrade_handover_duplicate_import(tmpdir):
+    """规则升级交接包：重复导入同一包不能重复落审计"""
+    print("\n== Test 54: Rules upgrade handover duplicate import prevention ==")
+    sp_a = os.path.join(tmpdir, "state_t54_a.json")
+    sp_b = os.path.join(tmpdir, "state_t54_b.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t54_a.json")
+    cleanup_patterns(tmpdir, "state_t54_b.json")
+
+    print("\n  [Machine A] 导出交接包...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+
+    pkg = os.path.join(tmpdir, "ru_handover_t54.json")
+    run_cli_with_rules(
+        ["export_rules_upgrade_package", "-o", pkg, "--operator", "用户A-54"],
+        sp_a, stricter_rules
+    )
+
+    print("\n  [Machine B] 第一次导入并确认...")
+    run_cli(["import", SAMPLE], sp_b)
+    run_cli_with_rules(["import_rules_upgrade_package", pkg, "--operator", "用户B-54"],
+                       sp_b, stricter_rules)
+    run_cli_with_rules(["rules_upgrade_handover_confirm", "--operator", "用户B-54"],
+                       sp_b, stricter_rules)
+
+    s_after_first = read_state(sp_b)
+    imports_after_first = len(s_after_first.get("imported_rules_upgrade_packages", []))
+    handover_history_after_first = len(s_after_first.get("rules_upgrade_handover_history", []))
+    audit_after_first = len([e for e in s_after_first["audit_log"]
+                             if e["action"] == "rules_upgrade_handover_confirmed"])
+
+    assert_eq(imports_after_first, 1, "t54: 第一次导入后有 1 个导入记录")
+    assert_eq(audit_after_first, 1, "t54: 第一次导入后有 1 个确认审计事件")
+
+    print("\n  [Machine B] 尝试重复导入同一包...")
+    res_dup = run_cli_with_rules(
+        ["import_rules_upgrade_package", pkg, "--operator", "用户B-54"],
+        sp_b, stricter_rules, expect_fail=True
+    )
+    assert_in("already imported", res_dup.stdout.lower() + " " + res_dup.stderr.lower(),
+              "t54: 应提示包已导入")
+
+    s_after_dup = read_state(sp_b)
+    imports_after_dup = len(s_after_dup.get("imported_rules_upgrade_packages", []))
+    audit_after_dup = len([e for e in s_after_dup["audit_log"]
+                           if e["action"] == "rules_upgrade_handover_confirmed"])
+
+    assert_eq(imports_after_dup, imports_after_first, "t54: 重复导入不增加导入记录")
+    assert_eq(audit_after_dup, audit_after_first, "t54: 重复导入不增加审计事件")
+
+    print("\n  [OK] 规则升级交接包防重复导入功能正常")
+    cleanup_patterns(tmpdir, "state_t54_a.json")
+    cleanup_patterns(tmpdir, "state_t54_b.json")
+
+
+def test_55_rules_upgrade_handover_confirm_and_revoke(tmpdir):
+    """规则升级交接包：确认导入与撤销回滚"""
+    print("\n== Test 55: Rules upgrade handover confirm and revoke ==")
+    sp_a = os.path.join(tmpdir, "state_t55_a.json")
+    sp_b = os.path.join(tmpdir, "state_t55_b.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t55_a.json")
+    cleanup_patterns(tmpdir, "state_t55_b.json")
+
+    print("\n  [Machine A] 导出交接包...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+
+    pkg = os.path.join(tmpdir, "ru_handover_t55.json")
+    run_cli_with_rules(
+        ["export_rules_upgrade_package", "-o", pkg, "--operator", "用户A-55"],
+        sp_a, stricter_rules
+    )
+
+    print("\n  [Machine B] 导入对账（只读）...")
+    run_cli(["import", SAMPLE], sp_b)
+    s_before_import = read_state(sp_b)
+    rules_ver_before = s_before_import["rules_version"]
+    chg003_before = next(i for i in s_before_import["items"] if i["id"] == "CHG-003")
+    risk_before = chg003_before["risk_level"]
+
+    res_import = run_cli_with_rules(
+        ["import_rules_upgrade_package", pkg, "--operator", "用户B-55"],
+        sp_b, stricter_rules
+    )
+    assert_in("RECONCILED", res_import.stdout, "t55: 对账完成")
+
+    s_pending = read_state(sp_b)
+    assert s_pending.get("pending_rules_upgrade_import") is not None, "t55: 创建 pending"
+    assert s_pending["rules_version"] == rules_ver_before, "t55: 对账阶段不修改 rules_version"
+    chg003_pending = next(i for i in s_pending["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_pending["risk_level"], risk_before, "t55: 对账阶段不修改 items")
+
+    print("\n  [Machine B] 查看交接详情...")
+    res_detail = run_cli_with_rules(["rules_upgrade_handover_detail"], sp_b, stricter_rules)
+    assert_in("RULES UPGRADE HANDOVER DETAIL", res_detail.stdout, "t55: 详情显示标题")
+    assert_in("[PENDING CONFIRMATION]", res_detail.stdout, "t55: 显示待确认状态")
+
+    print("\n  [Machine B] 确认导入...")
+    res_confirm = run_cli_with_rules(
+        ["rules_upgrade_handover_confirm", "--operator", "用户B-55"],
+        sp_b, stricter_rules
+    )
+    assert_in("RULES UPGRADE HANDOVER CONFIRMED", res_confirm.stdout, "t55: 确认成功")
+
+    s_confirmed = read_state(sp_b)
+    assert s_confirmed.get("pending_rules_upgrade_import") is None, "t55: 确认后 pending 清空"
+    assert len(s_confirmed.get("imported_rules_upgrade_packages", [])) == 1, "t55: 有 1 条导入记录"
+    assert len(s_confirmed.get("rules_upgrade_handover_history", [])) == 1, "t55: 有 1 条交接历史"
+    assert len(s_confirmed.get("rules_upgrade_history", [])) == 1, "t55: 有 1 条升级历史"
+
+    imp_record = s_confirmed["imported_rules_upgrade_packages"][0]
+    assert_eq(imp_record["confirmed_by"], "用户B-55", "t55: 导入记录操作人正确")
+    assert_eq(imp_record["revoked"], False, "t55: 未撤销")
+
+    print("\n  [Machine B] 撤销导入...")
+    res_revoke = run_cli_with_rules(
+        ["rules_upgrade_handover_revoke", "--operator", "用户B-55",
+         "--reason", "测试撤销", "--import-id", imp_record["import_id"],
+         "--force"],
+        sp_b, stricter_rules
+    )
+    assert_in("revoked successfully", res_revoke.stdout, "t55: 撤销成功")
+
+    s_revoked = read_state(sp_b)
+    assert len(s_revoked.get("imported_rules_upgrade_packages", [])) == 1, "t55: 撤销后仍保留记录"
+    imp_revoked = s_revoked["imported_rules_upgrade_packages"][0]
+    assert_eq(imp_revoked["revoked"], True, "t55: 标记为已撤销")
+    assert_eq(imp_revoked["revoke_reason"], "测试撤销", "t55: 撤销原因正确")
+    assert_eq(imp_revoked["revoked_by"], "用户B-55", "t55: 撤销人正确")
+
+    assert len(s_revoked.get("rules_upgrade_history", [])) == 1, "t55: 升级历史仍保留"
+    hist_revoked = s_revoked["rules_upgrade_history"][0]
+    assert_eq(hist_revoked["revoked"], True, "t55: 升级历史也标记为已撤销")
+
+    print("\n  [OK] 规则升级交接包确认与撤销功能正常")
+    cleanup_patterns(tmpdir, "state_t55_a.json")
+    cleanup_patterns(tmpdir, "state_t55_b.json")
+
+
+def test_56_rules_upgrade_handover_cross_restart(tmpdir):
+    """规则升级交接包：跨重启恢复 - 待确认导入持久化后重启能识别为续做"""
+    print("\n== Test 56: Rules upgrade handover cross-restart resume ==")
+    sp_a = os.path.join(tmpdir, "state_t56_a.json")
+    sp_b = os.path.join(tmpdir, "state_t56_b.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t56_a.json")
+    cleanup_patterns(tmpdir, "state_t56_b.json")
+
+    print("\n  [Machine A] 导出交接包...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+
+    pkg = os.path.join(tmpdir, "ru_handover_t56.json")
+    run_cli_with_rules(
+        ["export_rules_upgrade_package", "-o", pkg, "--operator", "用户A-56"],
+        sp_a, stricter_rules
+    )
+
+    print("\n  [Machine B] 导入对账，创建待确认...")
+    run_cli(["import", SAMPLE], sp_b)
+    run_cli_with_rules(
+        ["import_rules_upgrade_package", pkg, "--operator", "用户B-56"],
+        sp_b, stricter_rules
+    )
+
+    s_before = read_state(sp_b)
+    pending = s_before["pending_rules_upgrade_import"]
+    import_id = pending["import_id"]
+    import_pid = pending["import_pid"]
+    safe_print(f"  导入 ID: {import_id}")
+    safe_print(f"  导入 PID: {import_pid}")
+
+    print("\n  [Machine B] 做些后续工作，模拟重启前的进展...")
+    run_cli_with_rules(["confirm", "overview"], sp_b, stricter_rules)
+
+    print("\n  [Machine B] 模拟重启：修改 import_pid 为不同的值...")
+    s_before_restart = read_state(sp_b)
+    s_before_restart["pending_rules_upgrade_import"]["import_pid"] = 99999
+    with open(sp_b, "w", encoding="utf-8") as f:
+        json.dump(s_before_restart, f, ensure_ascii=False, indent=2)
+
+    print("\n  [Machine B] 重启后查看审计视图（应检测为续做）...")
+    audit_script = os.path.join(tmpdir, "run_audit_t56.py")
+    with open(audit_script, "w", encoding="utf-8") as f:
+        f.write(f"""
+import sys
+sys.path.insert(0, r"{SCRIPT_DIR}")
+from release_cli import main as cli_main
+sys.argv = ["release_cli.py", "--rules", r"{stricter_rules}", "--state", r"{sp_b}", "audit_view"]
+cli_main()
+""")
+    result = subprocess.run(
+        [sys.executable, audit_script],
+        capture_output=True,
+        cwd=SCRIPT_DIR,
+    )
+    audit_output = result.stdout.decode('utf-8', errors='replace') + result.stderr.decode('utf-8', errors='replace')
+
+    assert_in("Cross-restart:  YES", audit_output, "t56: 审计视图显示跨重启")
+    assert_in("[RESUMED]", audit_output, "t56: 审计视图显示 [RESUMED] 标签")
+    assert_in("[RU HANDOVER]", audit_output, "t56: 审计视图显示 [RU HANDOVER] 标签")
+
+    s_after = read_state(sp_b)
+    pending_after = s_after["pending_rules_upgrade_import"]
+    assert_eq(pending_after.get("resumed_across_restart"), True, "t56: pending 标记为跨重启续做")
+
+    audit_actions = [e["action"] for e in s_after["audit_log"]]
+    assert_in("pending_rules_upgrade_handover_resumed_across_restart", audit_actions,
+              "t56: 审计日志包含续做事件")
+
+    print("\n  [OK] 规则升级交接包跨重启恢复检测功能正常")
+    cleanup_patterns(tmpdir, "state_t56_a.json")
+    cleanup_patterns(tmpdir, "state_t56_b.json")
+
+
+def test_57_full_e2e_rules_upgrade_handover_workflow(tmpdir):
+    """完整端到端：规则升级预检→导包→换人导入→重启恢复→继续处理→最终导出"""
+    print("\n== Test 57: FULL E2E Rules Upgrade Handover Workflow ==")
+    sp_a = os.path.join(tmpdir, "state_t57_a.json")
+    sp_b = os.path.join(tmpdir, "state_t57_b.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t57_a.json")
+    cleanup_patterns(tmpdir, "state_t57_b.json")
+
+    print("\n  [Phase 1 - Machine A] 初始导入 + 部分工作...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli(["amend", "CHG-001", "--field", "owner=张三"], sp_a)
+    run_cli(["confirm", "overview"], sp_a)
+
+    s_phase1 = read_state(sp_a)
+    rules_ver_initial = s_phase1["rules_version"]
+    safe_print(f"  初始规则版本: {rules_ver_initial[:16]}...")
+
+    print("\n  [Phase 2 - Machine A] 规则升级预检...")
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+
+    s_phase2 = read_state(sp_a)
+    pending = s_phase2["pending_rules_upgrade"]
+    upgrade_id = pending["upgrade_id"]
+    manual_count = pending["impact"]["summary"]["manual_decision_count"]
+    safe_print(f"  升级 ID: {upgrade_id}")
+    safe_print(f"  需人工决策: {manual_count} 项")
+
+    print("\n  [Phase 3 - Machine A] 导出规则升级交接包...")
+    pkg = os.path.join(tmpdir, "ru_handover_t57.json")
+    res_export = run_cli_with_rules(
+        ["export_rules_upgrade_package", "-o", pkg,
+         "--operator", "负责人A-57", "--note", "待决升级交接，CHG-003/CHG-005 需要决策"],
+        sp_a, stricter_rules
+    )
+    assert_in("Package checksum:", res_export.stdout, "t57: 导出显示校验和")
+
+    print("\n  [Phase 4 - Machine B] 换人导入交接包（对账）...")
+    run_cli(["import", SAMPLE], sp_b)
+    run_cli(["amend", "CHG-002", "--field", "owner=李四B"], sp_b)
+
+    res_import = run_cli_with_rules(
+        ["import_rules_upgrade_package", pkg, "--operator", "负责人B-57"],
+        sp_b, stricter_rules
+    )
+    assert_in("RECONCILED", res_import.stdout, "t57: 对账完成")
+    assert_in("AWAITING CONFIRMATION", res_import.stdout, "t57: 待确认")
+
+    s_pending = read_state(sp_b)
+    pending_imp = s_pending["pending_rules_upgrade_import"]
+    import_id = pending_imp["import_id"]
+    safe_print(f"  导入 ID: {import_id}")
+
+    print("\n  [Phase 5 - Machine B] 查看交接详情...")
+    res_detail = run_cli_with_rules(["rules_upgrade_handover_detail"], sp_b, stricter_rules)
+    assert_in("Conflicts", res_detail.stdout, "t57: 详情显示冲突")
+    assert_in("Decisions", res_detail.stdout, "t57: 详情显示决策")
+
+    print("\n  [Phase 6 - Machine B] 做些后续工作，模拟重启...")
+    run_cli_with_rules(["confirm", "changes"], sp_b, stricter_rules)
+
+    print("\n  [Phase 7 - Machine B] 模拟重启（修改 import_pid）...")
+    s_before_restart = read_state(sp_b)
+    s_before_restart["pending_rules_upgrade_import"]["import_pid"] = 99999
+    with open(sp_b, "w", encoding="utf-8") as f:
+        json.dump(s_before_restart, f, ensure_ascii=False, indent=2)
+
+    print("\n  [Phase 8 - Machine B] 重启后 audit_view 检测跨重启...")
+    audit_script = os.path.join(tmpdir, "audit_t57.py")
+    with open(audit_script, "w", encoding="utf-8") as f:
+        f.write(f"""
+import sys
+sys.path.insert(0, r"{SCRIPT_DIR}")
+from release_cli import main as cli_main
+sys.argv = ["release_cli.py", "--rules", r"{stricter_rules}", "--state", r"{sp_b}", "audit_view"]
+cli_main()
+""")
+    result = subprocess.run(
+        [sys.executable, audit_script],
+        capture_output=True,
+        cwd=SCRIPT_DIR,
+    )
+    audit_out = result.stdout.decode('utf-8', errors='replace') + result.stderr.decode('utf-8', errors='replace')
+    assert_in("Cross-restart:  YES", audit_out, "t57: 重启后检测到跨重启")
+    assert_in("[RESUMED]", audit_out, "t57: 重启后显示 [RESUMED]")
+
+    print("\n  [Phase 9 - Machine B] 确认交接包导入，应用升级...")
+    res_confirm = run_cli_with_rules(
+        ["rules_upgrade_handover_confirm", "--operator", "负责人B-57",
+         "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor,CHG-005.risk_level=high"],
+        sp_b, stricter_rules
+    )
+    assert_in("RULES UPGRADE HANDOVER CONFIRMED", res_confirm.stdout, "t57: 确认成功")
+
+    s_confirmed = read_state(sp_b)
+    assert_eq(len(s_confirmed.get("imported_rules_upgrade_packages", [])), 1, "t57: 导入记录正确")
+    imp = s_confirmed["imported_rules_upgrade_packages"][0]
+    assert imp.get("resumed_across_restart") == True, "t57: 导入记录标记为跨重启续做"
+
+    chg003 = next(i for i in s_confirmed["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003["risk_level"], "high", "t57: CHG-003 risk_level 已升级为 high")
+    assert_eq(chg003["category"], "refactor", "t57: CHG-003 category 已升级为 refactor")
+    chg005 = next(i for i in s_confirmed["items"] if i["id"] == "CHG-005")
+    assert_eq(chg005["risk_level"], "high", "t57: CHG-005 risk_level 已升级为 high")
+
+    print("\n  [Phase 10 - Machine B] 继续剩余审批工作...")
+    run_cli_with_rules(["confirm", "overview"], sp_b, stricter_rules)
+    run_cli_with_rules(["amend", "CHG-003", "--field", "owner=周七"], sp_b, stricter_rules)
+    run_cli_with_rules(["confirm", "migration"], sp_b, stricter_rules)
+    run_cli_with_rules(["confirm", "known_issues"], sp_b, stricter_rules)
+    run_cli_with_rules(["draft"], sp_b, stricter_rules)
+    run_cli_with_rules(["approve"], sp_b, stricter_rules)
+
+    s_approved = read_state(sp_b)
+    assert_eq(s_approved["approved"], True, "t57: 批准成功")
+
+    print("\n  [Phase 11 - Machine B] 导出最终 Markdown...")
+    md_out = os.path.join(tmpdir, "t57_final.md")
+    run_cli_with_rules(["export", "-o", md_out], sp_b, stricter_rules)
+    md = read_file(md_out)
+
+    assert_in("# Release Notes v2.1.0", md, "t57: 最终 Markdown 标题正确")
+    assert_in("owner:周七", md, "t57: Markdown 包含 CHG-003 owner=周七")
+    assert_in("risk:high", md, "t57: Markdown 包含 risk:high")
+
+    print("\n  [Phase 12 - 验证交接痕迹在文档中]")
+    assert_in("Rules Upgrade Handover History", md, "t57: Markdown 包含规则升级交接历史")
+    assert_in("Rules Upgrade History", md, "t57: Markdown 包含规则升级历史")
+    assert_in(upgrade_id, md, "t57: Markdown 包含 upgrade_id")
+    assert_in("负责人A-57", md, "t57: Markdown 包含导出人")
+    assert_in("负责人B-57", md, "t57: Markdown 包含导入人")
+
+    print("\n  [Phase 13 - 验证状态和审计视图]")
+    res_status = run_cli_with_rules(["status"], sp_b, stricter_rules)
+    assert_in("Active Rules Upgrade Handover Imports:", res_status.stdout,
+              "t57: status 显示活跃导入")
+    assert_in("[RESUMED]", res_status.stdout, "t57: status 显示 [RESUMED]")
+
+    res_audit_final = run_cli_with_rules(["audit_view"], sp_b, stricter_rules)
+    assert_in("[RU HANDOVER]", res_audit_final.stdout, "t57: audit_view 显示 [RU HANDOVER]")
+    assert_in("[RESUMED]", res_audit_final.stdout, "t57: audit_view 显示 [RESUMED]")
+
+    s_final = read_state(sp_b)
+    final_audit = [e["action"] for e in s_final["audit_log"]]
+    expected = [
+        "import", "amend", "confirm",
+        "rules_upgrade_package_import_reconciled",
+        "pending_rules_upgrade_handover_resumed_across_restart",
+        "rules_upgrade_handover_confirmed",
+        "approved", "export"
+    ]
+    for act in expected:
+        assert_in(act, final_audit, f"t57: 审计日志应包含 {act}")
+
+    print("\n  [OK] ====== TEST 57 完整链路全部通过 ======")
+    print(f"  1. 规则升级预检 OK")
+    print(f"  2. 导出规则升级交接包 OK")
+    print(f"  3. 换人导入对账（只读） OK")
+    print(f"  4. 查看交接详情 OK")
+    print(f"  5. 模拟重启 OK")
+    print(f"  6. 跨重启恢复检测 OK")
+    print(f"  7. 确认导入（带决策） OK")
+    print(f"  8. 继续审批工作 OK")
+    print(f"  9. 最终导出 Markdown OK")
+    print(f"  10. 交接痕迹在 Markdown 中可见 OK")
+    print(f"  11. status/audit_view 显示正确 OK")
+    print(f"  12. 审计日志完整 OK")
+
+    cleanup_patterns(tmpdir, "state_t57_a.json")
+    cleanup_patterns(tmpdir, "state_t57_b.json")
+
+
 def main():
     global PASS, FAIL
     try:
@@ -3755,6 +4312,13 @@ def main():
         test_48_rules_upgrade_cross_restart_resume(tmpdir)
         test_49_rules_upgrade_handover_preservation(tmpdir)
         test_50_full_e2e_rules_upgrade_workflow(tmpdir)
+        test_51_rules_upgrade_handover_export_pending(tmpdir)
+        test_52_rules_upgrade_handover_export_applied(tmpdir)
+        test_53_rules_upgrade_handover_import_conflict(tmpdir)
+        test_54_rules_upgrade_handover_duplicate_import(tmpdir)
+        test_55_rules_upgrade_handover_confirm_and_revoke(tmpdir)
+        test_56_rules_upgrade_handover_cross_restart(tmpdir)
+        test_57_full_e2e_rules_upgrade_handover_workflow(tmpdir)
     except Exception as e:
         fatal_exception = e
         safe_print(f"\n*** FATAL EXCEPTION during tests: {type(e).__name__}: {e} ***")

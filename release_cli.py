@@ -91,6 +91,9 @@ def _new_state(version, batch_id):
         "rules_snapshot": None,
         "rules_upgrade_history": [],
         "pending_rules_upgrade": None,
+        "rules_upgrade_handover_history": [],
+        "imported_rules_upgrade_packages": [],
+        "pending_rules_upgrade_import": None,
     }
 
 
@@ -2470,6 +2473,41 @@ def cmd_status(args, rules):
         print(f"  Next:          rules_upgrade_apply | rules_upgrade_skip")
         print(f"{'=' * 60}")
 
+    pending_ru_import = state.get("pending_rules_upgrade_import")
+    if pending_ru_import:
+        print()
+        print(f"{'=' * 60}")
+        print(f"[RULES UPGRADE HANDOVER: PENDING CONFIRMATION]")
+        print(f"  Import ID:       {pending_ru_import.get('import_id', '?')}")
+        print(f"  Upgrade ID:      {pending_ru_import.get('upgrade_id')}")
+        print(f"  Imported at:     {pending_ru_import.get('imported_at')}")
+        print(f"  Imported by:     {pending_ru_import.get('imported_by')}")
+        print(f"  Exported by:     {pending_ru_import.get('exported_by')}")
+        conflicts = pending_ru_import.get("conflicts", [])
+        if conflicts:
+            print(f"  Conflicts:       {len(conflicts)} detected (run rules_upgrade_handover_detail for list)")
+        if pending_ru_import.get("resumed_across_restart"):
+            print(f"  Resumed:         Yes (cross-restart)")
+        print(f"  Next:            rules_upgrade_handover_detail -> rules_upgrade_handover_confirm | rules_upgrade_handover_revoke")
+        print(f"{'=' * 60}")
+
+    ru_imports = state.get("imported_rules_upgrade_packages", [])
+    active_ru_imports = [imp for imp in ru_imports if not imp.get("revoked")]
+    if active_ru_imports:
+        print()
+        print(f"[Active Rules Upgrade Handover Imports: {len(active_ru_imports)}]")
+        for imp in active_ru_imports:
+            resumed_tag = " [RESUMED]" if imp.get("resumed_across_restart") else ""
+            print(f"  - {imp.get('import_id')} (upgrade:{imp.get('upgrade_id')}) by {imp.get('confirmed_by')} @ {imp.get('confirmed_at')}"
+                  f"{resumed_tag}")
+
+    revoked_ru_imports = [imp for imp in ru_imports if imp.get("revoked")]
+    if revoked_ru_imports:
+        print(f"[Revoked Rules Upgrade Handover Imports: {len(revoked_ru_imports)}]")
+        for imp in revoked_ru_imports:
+            print(f"  - {imp.get('import_id')} revoked by {imp.get('revoked_by')} @ {imp.get('revoked_at')}"
+                  f" reason={imp.get('revoke_reason','')[:40]}")
+
 
 def cmd_history(args, rules):
     state_path = args.state
@@ -2499,13 +2537,11 @@ def cmd_audit_view(args, rules):
 
     state.setdefault("takeover_history", [])
     state.setdefault("confirmed_takeover_sessions", {})
+    state.setdefault("rules_upgrade_handover_history", [])
+    state.setdefault("imported_rules_upgrade_packages", [])
     takeover_history = state.get("takeover_history", [])
     sessions = state.get("confirmed_takeover_sessions", {})
-
-    if not takeover_history and not state.get("pending_takeover"):
-        print("[INFO] No takeover history found.")
-        print("  (This state was never imported via import_package)")
-        return
+    ru_imports = state.get("imported_rules_upgrade_packages", [])
 
     current_pid = os.getpid()
     state_updated = False
@@ -2519,7 +2555,12 @@ def cmd_audit_view(args, rules):
         "rules_restored",
         "takeover_revoked_confirmed",
         "takeover_revoked_confirmed_rollback",
+        "rules_upgrade_package_import_reconciled",
+        "rules_upgrade_handover_confirmed",
+        "rules_upgrade_handover_revoked",
+        "rules_restored_from_handover_preview",
     }
+
     for takeover in takeover_history:
         tid = takeover.get("takeover_id")
         sess = sessions.get(tid, {})
@@ -2546,6 +2587,27 @@ def cmd_audit_view(args, rules):
                            f"takeover_id={tid} import_pid={import_pid} "
                            f"session_pid={session_pid} current_pid={current_pid}")
 
+    for ru_imp in ru_imports:
+        tid = ru_imp.get("import_id")
+        if not ru_imp.get("resumed_across_restart", False):
+            import_pid = ru_imp.get("import_pid")
+            imported_at = ru_imp.get("imported_at")
+            confirmed_at = ru_imp.get("confirmed_at")
+            baseline_ts = confirmed_at if confirmed_at else imported_at
+            if import_pid is not None and import_pid != current_pid:
+                has_subsequent_work = False
+                for event in audit_log:
+                    if event.get("timestamp", "") > (baseline_ts or "") and \
+                       event.get("action") not in confirmed_action_whitelist:
+                        has_subsequent_work = True
+                        break
+                if has_subsequent_work:
+                    ru_imp["resumed_across_restart"] = True
+                    state_updated = True
+                    _audit(state, "rules_upgrade_handover_resumed_across_restart",
+                           f"import_id={tid} import_pid={import_pid} "
+                           f"current_pid={current_pid}")
+
     pending = state.get("pending_takeover")
     if pending:
         for event in audit_log:
@@ -2560,11 +2622,32 @@ def cmd_audit_view(args, rules):
                            f"takeover_id={pending.get('takeover_id')} current_pid={current_pid}")
                 break
 
+    pending_ru = state.get("pending_rules_upgrade_import")
+    if pending_ru:
+        for event in audit_log:
+            if event.get("timestamp", "") > pending_ru.get("imported_at", "") and \
+               event.get("action") not in ("rules_upgrade_package_import_reconciled",
+                                           "rules_restored_from_handover_preview",
+                                           "rules_upgrade_handover_detail"):
+                if not pending_ru.get("resumed_across_restart"):
+                    pending_ru["resumed_across_restart"] = True
+                    state_updated = True
+                    _audit(state, "pending_rules_upgrade_handover_resumed_across_restart",
+                           f"import_id={pending_ru.get('import_id')} current_pid={current_pid}")
+                break
+
     if state_updated:
         save_state(state, state_path)
 
+    has_takeover = bool(takeover_history or state.get("pending_takeover"))
+    has_ru_handover = bool(ru_imports or state.get("pending_rules_upgrade_import"))
+
+    if not has_takeover and not has_ru_handover:
+        print("[INFO] No takeover or rules upgrade handover history found.")
+        return
+
     print("\n" + "=" * 70)
-    print("AUDIT VIEW - Takeover Timeline")
+    print("AUDIT VIEW - Takeover & Rules Upgrade Handover Timeline")
     print("=" * 70)
 
     if pending:
@@ -2736,6 +2819,83 @@ def cmd_audit_view(args, rules):
         else:
             print(f"    Cross-restart:  NO (same process session)")
 
+    pending_ru = state.get("pending_rules_upgrade_import")
+    if pending_ru:
+        tid = pending_ru.get("import_id", "?")
+        print(f"\n{'─' * 70}")
+        print(f"[PENDING RULES UPGRADE HANDOVER] {tid}")
+        print(f"{'─' * 70}")
+        print(f"  Imported at:    {pending_ru.get('imported_at')}")
+        print(f"  Imported by:    {pending_ru.get('imported_by')}")
+        print(f"  Exported by:    {pending_ru.get('exported_by')}")
+        print(f"  Exported at:    {pending_ru.get('exported_at')}")
+        print(f"  Upgrade ID:     {pending_ru.get('upgrade_id')}")
+        print(f"  Package:        {pending_ru.get('package_path')}")
+        conflicts = pending_ru.get("conflicts", [])
+        if conflicts:
+            print(f"  Conflicts:      {len(conflicts)} detected (use rules_upgrade_handover_detail for list)")
+        else:
+            print(f"  Conflicts:      None")
+        print(f"  Status:         AWAITING CONFIRMATION")
+        if pending_ru.get("resumed_across_restart"):
+            print(f"  Cross-restart:  YES (pending handover survived restart)")
+
+    for idx, ru_imp in enumerate(reversed(ru_imports)):
+        tid = ru_imp.get("import_id", "?")
+        if ru_imp.get("revoked"):
+            revoked_tag = " [REVOKED]"
+        else:
+            revoked_tag = ""
+        print(f"\n{'─' * 70}")
+        print(f"[RULES UPGRADE HANDOVER] {tid}{revoked_tag}")
+        print(f"{'─' * 70}")
+        print(f"  Imported at:    {ru_imp.get('imported_at')}")
+        print(f"  Imported by:    {ru_imp.get('imported_by')}")
+        print(f"  Exported by:    {ru_imp.get('exported_by')}")
+        print(f"  Exported at:    {ru_imp.get('exported_at')}")
+        print(f"  Upgrade ID:     {ru_imp.get('upgrade_id')}")
+        print(f"  Package:        {ru_imp.get('package_path')}")
+        if ru_imp.get("confirmed_at"):
+            print(f"  Confirmed at:   {ru_imp.get('confirmed_at')}")
+            print(f"  Confirmed by:   {ru_imp.get('confirmed_by')}")
+        if ru_imp.get("note"):
+            print(f"  Note:           {ru_imp.get('note')}")
+
+        conflicts = ru_imp.get("conflicts", [])
+        if conflicts:
+            print(f"\n  [Conflicts] ({len(conflicts)})")
+            for c in conflicts[:5]:
+                print(f"    - {c.get('type')}: {c.get('message','')[:60]}")
+            if len(conflicts) > 5:
+                print(f"    ... and {len(conflicts) - 5} more")
+
+        decisions = ru_imp.get("decisions_log", [])
+        if decisions:
+            print(f"\n  [Conflict Decisions] ({len(decisions)})")
+            for d in decisions[:5]:
+                print(f"    [{d.get('ts','')[:19]}] {d.get('conflict_type')}: "
+                      f"{d.get('decision')} by {d.get('operator','')}")
+            if len(decisions) > 5:
+                print(f"    ... and {len(decisions) - 5} more")
+
+        print(f"\n  [Decisions]")
+        if ru_imp.get("confirmed_by"):
+            print(f"    Decision maker: {ru_imp.get('confirmed_by')} (confirmed)")
+            print(f"    Decision time:  {ru_imp.get('confirmed_at')}")
+        else:
+            print(f"    Decision maker: {ru_imp.get('imported_by')} (imported)")
+            print(f"    Decision time:  {ru_imp.get('imported_at')}")
+        if ru_imp.get('resumed_across_restart'):
+            print(f"    Cross-restart:  YES (resumed after process restart)")
+        else:
+            print(f"    Cross-restart:  NO (same process session)")
+
+        if ru_imp.get("revoked"):
+            print(f"\n  [Revoked]")
+            print(f"    Revoked at:     {ru_imp.get('revoked_at')}")
+            print(f"    Revoked by:     {ru_imp.get('revoked_by')}")
+            print(f"    Reason:         {ru_imp.get('revoke_reason')}")
+
     print(f"\n{'─' * 70}")
     print(f"[Timeline Summary]")
     all_events = []
@@ -2779,21 +2939,57 @@ def cmd_audit_view(args, rules):
             "pending": True,
         })
 
+    pending_ru = state.get("pending_rules_upgrade_import")
+    if pending_ru:
+        all_events.append({
+            "ts": pending_ru.get("imported_at"),
+            "type": "rules_upgrade_handover",
+            "action": "pending_rules_upgrade_handover_reconciled",
+            "detail": f"import_id={pending_ru.get('import_id')} upgrade_id={pending_ru.get('upgrade_id')} by {pending_ru.get('imported_by')}",
+            "pending": True,
+            "resumed": pending_ru.get("resumed_across_restart", False),
+        })
+
+    for ru_imp in ru_imports:
+        ru_ts = ru_imp.get("confirmed_at") or ru_imp.get("imported_at")
+        ru_action = "rules_upgrade_handover_confirmed" if ru_imp.get("confirmed_at") else "rules_upgrade_package_import_reconciled"
+        ru_by = ru_imp.get("confirmed_by") or ru_imp.get("imported_by")
+        all_events.append({
+            "ts": ru_ts,
+            "type": "rules_upgrade_handover",
+            "action": ru_action,
+            "detail": f"import_id={ru_imp.get('import_id')} upgrade_id={ru_imp.get('upgrade_id')} by {ru_by}",
+            "resumed": ru_imp.get("resumed_across_restart", False),
+            "revoked": ru_imp.get("revoked", False),
+        })
+        if ru_imp.get("revoked"):
+            all_events.append({
+                "ts": ru_imp.get("revoked_at"),
+                "type": "rules_upgrade_handover",
+                "action": "rules_upgrade_handover_revoked",
+                "detail": (f"import_id={ru_imp.get('import_id')} "
+                          f"by {ru_imp.get('revoked_by')} reason={ru_imp.get('revoke_reason','')[:40]}"),
+            })
+
     all_events.sort(key=lambda x: x.get("ts", ""))
 
     print(f"  Total events: {len(all_events)}")
     print()
     for ev in all_events:
+        tags = []
         if ev.get("pending"):
-            tag = "[PENDING]"
-        elif ev.get("revoked"):
-            tag = "[REVOKED]"
-        elif ev["type"] == "takeover":
-            tag = "[TAKEOVER]"
-        else:
-            tag = "[AUDIT]"
+            tags.append("[PENDING]")
+        if ev.get("revoked"):
+            tags.append("[REVOKED]")
+        if ev["type"] == "takeover":
+            tags.append("[TAKEOVER]")
+        elif ev["type"] == "rules_upgrade_handover":
+            tags.append("[RU HANDOVER]")
+        if not tags:
+            tags.append("[AUDIT]")
         resumed_tag = " [RESUMED]" if ev.get("resumed") else ""
-        print(f"  [{ev['ts']}] {tag}{resumed_tag} {ev['action']}: {ev['detail'][:80]}")
+        tag_str = "".join(tags)
+        print(f"  [{ev['ts']}] {tag_str}{resumed_tag} {ev['action']}: {ev['detail'][:80]}")
 
     print("\n" + "=" * 70)
     print("AUDIT VIEW COMPLETE")
@@ -4127,6 +4323,1029 @@ def cmd_rules_history(args, rules):
     print()
 
 
+def _compute_rules_upgrade_package_checksum(package):
+    relevant = {
+        "package_format_version": package.get("package_format_version"),
+        "exported_at": package.get("exported_at"),
+        "upgrade_id": package.get("upgrade_id"),
+        "old_rules_version": package.get("old_rules_version"),
+        "new_rules_version": package.get("new_rules_version"),
+        "decisions_log": package.get("decisions_log", []),
+    }
+    serialized = json.dumps(relevant, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _build_rules_upgrade_handover_package(state, upgrade_source, operator, rules_path, description, note):
+    rules_copy = None
+    if rules_path and os.path.exists(rules_path):
+        with open(rules_path, "r", encoding="utf-8") as f:
+            rules_copy = f.read()
+
+    if upgrade_source == "pending":
+        pending = state.get("pending_rules_upgrade")
+        if not pending:
+            print("[ERROR] No pending rules upgrade found.")
+            return None
+        upgrade_id = pending["upgrade_id"]
+        upgrade_data = pending
+        source_type = "pending"
+    else:
+        history = state.get("rules_upgrade_history", [])
+        target = None
+        for rec in reversed(history):
+            if rec.get("upgrade_id") == upgrade_source or (upgrade_source == "latest" and not rec.get("revoked")):
+                target = rec
+                break
+        if target is None:
+            print(f"[ERROR] Rules upgrade '{upgrade_source}' not found in history.")
+            return None
+        upgrade_id = target["upgrade_id"]
+        upgrade_data = target
+        source_type = "applied"
+
+    package = {
+        "package_format_version": PACKAGE_FORMAT_VERSION,
+        "exported_at": datetime.now().isoformat(),
+        "exported_by": operator or _get_identity(),
+        "description": description or "",
+        "note": note or "",
+        "upgrade_id": upgrade_id,
+        "source_type": source_type,
+        "source_upgrade_snapshot": copy.deepcopy(upgrade_data),
+        "old_rules_version": upgrade_data.get("old_rules_version"),
+        "new_rules_version": upgrade_data.get("new_rules_version"),
+        "rules_diff": upgrade_data.get("rules_diff"),
+        "impact": upgrade_data.get("impact"),
+        "decisions": upgrade_data.get("decisions", {}),
+        "decisions_log": upgrade_data.get("decisions_log", []),
+        "pre_upgrade_items_snapshot": copy.deepcopy(
+            upgrade_data.get("pre_upgrade_state_snapshot", {}).get("items")
+            if source_type == "applied" and upgrade_data.get("pre_upgrade_state_snapshot", {}).get("items")
+            else state.get("items", [])
+        ),
+        "current_rules_snapshot": rules_copy,
+        "state_rules_version_at_export": state.get("rules_version"),
+        "package_checksum": None,
+        "metadata": {
+            "exported_from_state_version": state.get("version"),
+            "exported_from_draft_version": state.get("draft_version"),
+            "exported_from_approved": state.get("approved"),
+            "rules_upgrade_history_count": len(state.get("rules_upgrade_history", [])),
+            "revoked_in_source": upgrade_data.get("revoked", False),
+            "has_pending_rules_upgrade": state.get("pending_rules_upgrade") is not None,
+        }
+    }
+
+    package["package_checksum"] = _compute_rules_upgrade_package_checksum(package)
+    return package
+
+
+def _validate_rules_upgrade_handover_package(package):
+    if not isinstance(package, dict):
+        return False, "Package is not a valid JSON object"
+    if "package_format_version" not in package:
+        return False, "Missing package_format_version"
+    if package["package_format_version"] != PACKAGE_FORMAT_VERSION:
+        return False, (f"Incompatible package format version: {package['package_format_version']} "
+                      f"(expected {PACKAGE_FORMAT_VERSION})")
+    if "upgrade_id" not in package:
+        return False, "Package missing 'upgrade_id' field"
+    if "source_upgrade_snapshot" not in package:
+        return False, "Package missing 'source_upgrade_snapshot' field"
+    if "package_checksum" not in package:
+        return False, "Package missing 'package_checksum' field"
+
+    temp_pkg = copy.deepcopy(package)
+    temp_pkg["package_checksum"] = None
+    expected = _compute_rules_upgrade_package_checksum(temp_pkg)
+    if expected != package["package_checksum"]:
+        return False, "Package checksum mismatch: package may be corrupted"
+
+    return True, "Package valid"
+
+
+def _detect_rules_upgrade_handover_conflicts(local_state, package, rules_path, existing_import_info=None):
+    conflicts = []
+
+    if existing_import_info:
+        if existing_import_info.get("package_checksum") != package.get("package_checksum"):
+            conflicts.append({
+                "type": "package_checksum_changed",
+                "severity": "high",
+                "message": ("Package content has changed since last reconcile "
+                           "(different package_checksum). Re-export from source recommended."),
+                "resolution_options": ["skip", "reimport", "override"],
+            })
+        if existing_import_info.get("exported_at") != package.get("exported_at"):
+            conflicts.append({
+                "type": "package_re_exported",
+                "severity": "high",
+                "message": ("Package has been re-exported at a different time. "
+                           f"Old: {existing_import_info.get('exported_at')} "
+                           f"New: {package.get('exported_at')}"),
+                "resolution_options": ["skip", "reimport", "override"],
+            })
+
+    if local_state is not None:
+        local_rules_ver = local_state.get("rules_version")
+        pkg_old_ver = package.get("old_rules_version")
+        if local_rules_ver and pkg_old_ver and local_rules_ver != pkg_old_ver:
+            conflicts.append({
+                "type": "local_rules_version_mismatch",
+                "severity": "high",
+                "message": (f"Local rules version mismatch. "
+                           f"Local: {local_rules_ver[:16]}..., "
+                           f"Package expects base: {pkg_old_ver[:16]}..."),
+                "resolution_options": ["skip", "override"],
+            })
+
+        local_items = {it.get("id"): it for it in local_state.get("items", [])}
+        pkg_pre_items = {it.get("id"): it for it in package.get("pre_upgrade_items_snapshot", [])}
+        diverged_items = []
+        for iid in set(local_items.keys()) & set(pkg_pre_items.keys()):
+            lit = local_items[iid]
+            pit = pkg_pre_items[iid]
+            if (lit.get("_version", 1) != pit.get("_version", 1) or
+                lit.get("_last_modified_at") != pit.get("_last_modified_at")):
+                diverged_items.append(iid)
+        if diverged_items:
+            conflicts.append({
+                "type": "item_state_diverged",
+                "severity": "high",
+                "message": (f"Some items have diverged between local state and package base snapshot: "
+                           f"{', '.join(diverged_items[:5])}"
+                           f"{' ...' if len(diverged_items) > 5 else ''}"),
+                "resolution_options": ["skip", "override"],
+            })
+
+        if local_state.get("approved"):
+            conflicts.append({
+                "type": "state_already_approved",
+                "severity": "high",
+                "message": "Local state is already APPROVED - import will clear approval",
+                "resolution_options": ["skip", "override"],
+            })
+
+    rules_diff = _compare_rules_diff(rules_path, package.get("current_rules_snapshot"))
+    if rules_diff.get("has_rules_snapshot") and not rules_diff.get("identical", True):
+        if rules_diff.get("local_rules_missing"):
+            conflicts.append({
+                "type": "local_rules_missing",
+                "severity": "low",
+                "message": "Local rules file missing. Package contains a rules snapshot.",
+                "resolution_options": ["skip", "override"],
+            })
+        else:
+            conflicts.append({
+                "type": "rules_differs",
+                "severity": "medium",
+                "message": "Local rules.yaml differs from package rules snapshot.",
+                "resolution_options": ["skip", "override"],
+            })
+
+    return conflicts
+
+
+def cmd_export_rules_upgrade_package(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found. Run 'import' first.")
+        sys.exit(1)
+
+    upgrade_source = args.upgrade_source or "pending"
+    operator = args.operator or _get_identity()
+    description = args.description or ""
+    note = args.note or ""
+    include_rules = not args.no_rules
+
+    package = _build_rules_upgrade_handover_package(
+        state, upgrade_source, operator,
+        args.rules if include_rules else None,
+        description, note
+    )
+    if package is None:
+        sys.exit(1)
+
+    out_path = args.output
+    if not out_path:
+        upgrade_id = package["upgrade_id"]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(SCRIPT_DIR, f"rules_upgrade_pkg_{upgrade_id}_{ts}.json")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(package, f, ensure_ascii=False, indent=2)
+
+    _audit(state, "rules_upgrade_package_exported",
+           f"operator={operator} output={out_path} "
+           f"upgrade_id={package['upgrade_id']} "
+           f"source_type={package['source_type']} "
+           f"description={description} note={note}")
+
+    state.setdefault("rules_upgrade_handover_history", []).append({
+        "type": "export",
+        "package_checksum": package["package_checksum"],
+        "exported_at": package["exported_at"],
+        "exported_by": operator,
+        "upgrade_id": package["upgrade_id"],
+        "source_type": package["source_type"],
+        "output_path": out_path,
+        "description": description,
+        "note": note,
+    })
+    save_state(state, state_path)
+
+    print(f"\n{'=' * 70}")
+    print(f"RULES UPGRADE HANDOVER PACKAGE EXPORTED")
+    print(f"{'=' * 70}")
+    print(f"  Output:            {out_path}")
+    print(f"  Format version:    {PACKAGE_FORMAT_VERSION}")
+    print(f"  Exported by:       {operator}")
+    print(f"  Upgrade ID:      {package['upgrade_id']}")
+    print(f"  Source type:     {package['source_type']}")
+    if package.get('description'):
+        print(f"  Description:      {package['description']}")
+    if package.get('note'):
+        print(f"  Note:             {package['note']}")
+    print(f"  Rules snapshot:    {'included' if include_rules and package.get('current_rules_snapshot') else 'excluded'}")
+    print()
+    print(f"  Old rules ver:    {str(package.get('old_rules_version', ''))[:16]}...")
+    print(f"  New rules ver:    {str(package.get('new_rules_version', ''))[:16]}...")
+    print(f"  Auto-migrate:    {package.get('impact', {}).get('summary', {}).get('auto_migratable_count', 0)}")
+    print(f"  Manual decisions: {len(package.get('decisions_log', []))}")
+    print(f"  Package checksum: {package['package_checksum'][:16]}...")
+    print()
+    print(f"  Receiver: run 'rules_upgrade_import_package' to import this package")
+    print(f"  Receiver: run 'rules_upgrade_handover_confirm' after import")
+    print(f"{'=' * 70}")
+    print()
+
+
+def cmd_import_rules_upgrade_package(args, rules):
+    state_path = args.state
+    package_path = args.package
+
+    if not os.path.exists(package_path):
+        print(f"[ERROR] Package file not found: {package_path}")
+        sys.exit(1)
+
+    with open(package_path, "r", encoding="utf-8") as f:
+        package = json.load(f)
+
+    valid, msg = _validate_rules_upgrade_handover_package(package)
+    if not valid:
+        print(f"[REJECTED] Package validation failed: {msg}")
+        sys.exit(1)
+
+    target_state = load_state(state_path)
+    operator = args.operator or _get_identity()
+
+    print(f"\n{'=' * 70}")
+    print(f"RULES UPGRADE PACKAGE IMPORT - READ-ONLY RECONCILE")
+    print(f"{'=' * 70}")
+    print(f"  Package file:    {package_path}")
+    print(f"  Package format:  {package['package_format_version']}")
+    print(f"  Exported at:   {package.get('exported_at')}")
+    print(f"  Exported by:     {package.get('exported_by')}")
+    print(f"  Upgrade ID:     {package['upgrade_id']}")
+    print(f"  Source type:    {package['source_type']}")
+    print(f"  Imported by:     {operator}")
+    print()
+
+    imported_pkgs = target_state.get("imported_rules_upgrade_packages", []) if target_state else []
+    existing_import = None
+    for imp in imported_pkgs:
+        if imp.get("upgrade_id") == package["upgrade_id"] and not imp.get("revoked"):
+            existing_import = imp
+            break
+
+    if existing_import and existing_import.get("confirmed"):
+        print(f"[BLOCKED] Package for upgrade_id={package['upgrade_id']} already imported and confirmed.")
+        print(f"  Imported at: {existing_import.get('imported_at')}")
+        print(f"  Imported by: {existing_import.get('imported_by')}")
+        print(f"  Use --force to re-import (will create new reconciliation, requires re-confirm)")
+        if not args.force:
+            sys.exit(1)
+
+    print(f"[Package Information]")
+    print(f"  Old rules ver:  {str(package.get('old_rules_version', ''))[:16]}...")
+    print(f"  New rules ver:  {str(package.get('new_rules_version', ''))[:16]}...")
+    impact = package.get("impact", {}).get("summary", {})
+    print(f"  Auto-migrate:  {impact.get('auto_migratable_count', 0)}")
+    print(f"  Conf rollback: {impact.get('confirmation_rollback_count', 0)}")
+    print(f"  Manual dec:    {impact.get('manual_decision_count', 0)}")
+    print(f"  Decisions log: {len(package.get('decisions_log', []))} entries")
+    print()
+
+    existing_import_info = None
+    if target_state and target_state.get("pending_rules_upgrade_import"):
+        pending = target_state["pending_rules_upgrade_import"]
+        if pending.get("upgrade_id") == package["upgrade_id"]:
+            existing_import_info = {
+                "package_checksum": pending.get("package_checksum"),
+                "exported_at": pending.get("exported_at"),
+            }
+
+    conflicts = _detect_rules_upgrade_handover_conflicts(
+        target_state, package, args.rules, existing_import_info
+    )
+
+    if conflicts:
+        print(f"[CONFLICTS DETECTED] ({len(conflicts)})")
+        for i, c in enumerate(conflicts, 1):
+            sev_tag = {
+                "high": "[HIGH]",
+                "medium": "[MED]",
+                "low": "[LOW]",
+            }.get(c.get("severity", "medium"), "[MED]")
+            print(f"  {i}. {sev_tag} {c['type']}: {c['message']}")
+            opts = c.get("resolution_options", [])
+            if opts:
+                print(f"     Resolution options: {', '.join(opts)}")
+        print()
+
+    state_for_pending = copy.deepcopy(target_state) if target_state else _new_state(
+        package["metadata"].get("exported_from_state_version", "UNKNOWN"),
+        package["metadata"].get("current_batch_id", "pending-batch"),
+    )
+    state_for_pending.setdefault("rules_upgrade_handover_history", [])
+    state_for_pending.setdefault("imported_rules_upgrade_packages", [])
+
+    import_id = hashlib.sha256(
+        f"{datetime.now().isoformat()}{operator}{package_path}{package['upgrade_id']}".encode()
+    ).hexdigest()[:16]
+
+    state_for_pending["pending_rules_upgrade_import"] = {
+        "import_id": import_id,
+        "imported_at": datetime.now().isoformat(),
+        "imported_by": operator,
+        "import_pid": os.getpid(),
+        "upgrade_id": package["upgrade_id"],
+        "package_path": os.path.basename(package_path),
+        "package_path_full": package_path,
+        "package_checksum": package["package_checksum"],
+        "exported_at": package["exported_at"],
+        "exported_by": package["exported_by"],
+        "source_type": package["source_type"],
+        "package": copy.deepcopy(package),
+        "conflicts": conflicts,
+        "decisions_log": [],
+        "status": "pending_confirmation",
+        "confirmed": False,
+        "confirmed_at": None,
+        "confirmed_by": None,
+        "resumed_across_restart": False,
+    }
+
+    if package.get("current_rules_snapshot") and args.apply_rules_snapshot:
+        rules_dir = os.path.dirname(args.rules)
+        if not os.path.exists(rules_dir):
+            os.makedirs(rules_dir, exist_ok=True)
+        with open(args.rules, "w", encoding="utf-8") as f:
+            f.write(package["current_rules_snapshot"])
+        print(f"[INFO] Rules snapshot restored to {args.rules}")
+        _audit(state_for_pending, "rules_restored_from_handover_preview",
+               f"from_package={package_path} operator={operator} import_id={import_id}")
+
+    _audit(state_for_pending, "rules_upgrade_package_import_reconciled",
+           f"import_id={import_id} operator={operator} package={package_path} "
+           f"upgrade_id={package['upgrade_id']} "
+           f"exported_by={package.get('exported_by')} "
+           f"conflicts={len(conflicts)} status=pending_confirmation")
+
+    save_state(state_for_pending, state_path)
+
+    print()
+    print(f"{'=' * 70}")
+    print(f"[STATUS] RECONCILED - AWAITING CONFIRMATION")
+    print(f"{'=' * 70}")
+    print(f"  Import ID:       {import_id}")
+    print(f"  State file written with pending_rules_upgrade_import (read-only, not committed).")
+    print()
+    print(f"  Next steps:")
+    print(f"    1. View details:   release_cli.py --state {state_path} rules_upgrade_handover_detail")
+    print(f"    2. Confirm import: release_cli.py --state {state_path} rules_upgrade_handover_confirm")
+    print(f"    3. Cancel:          release_cli.py --state {state_path} rules_upgrade_handover_revoke")
+    print(f"{'=' * 70}")
+    print()
+
+
+def cmd_rules_upgrade_handover_detail(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    state.setdefault("rules_upgrade_handover_history", [])
+    state.setdefault("imported_rules_upgrade_packages", [])
+
+    pending = state.get("pending_rules_upgrade_import")
+    import_id = getattr(args, "import_id", None)
+    target = None
+    is_pending = False
+
+    if pending and (import_id is None or pending.get("import_id") == import_id):
+        target = pending
+        is_pending = True
+    elif import_id:
+        for imp in state.get("imported_rules_upgrade_packages", []):
+            if imp.get("import_id") == import_id:
+                target = imp
+                break
+        if target is None:
+            for hist in state.get("rules_upgrade_handover_history", []):
+                if hist.get("import_id") == import_id:
+                    target = hist
+                    break
+
+    if target is None:
+        print("[INFO] No rules upgrade handover record found.")
+        print("  Run 'rules_upgrade_import_package' first.")
+        return
+
+    tid = target.get("import_id", "?")
+    print(f"\n{'=' * 70}")
+    tag = " [PENDING CONFIRMATION]" if is_pending else ""
+    if target.get("confirmed") or target.get("confirmed_at"):
+        tag = " [CONFIRMED / PERSISTED]"
+    print(f"RULES UPGRADE HANDOVER DETAIL: {tid}{tag}")
+    print(f"{'=' * 70}")
+
+    print(f"\n[Basic Info]")
+    print(f"  Import ID:        {tid}")
+    print(f"  Imported at:      {target.get('imported_at')}")
+    print(f"  Imported by:    {target.get('imported_by')}")
+    print(f"  Exported by:    {target.get('exported_by')}")
+    print(f"  Exported at:      {target.get('exported_at')}")
+    print(f"  Upgrade ID:      {target.get('upgrade_id')}")
+    print(f"  Source type:     {target.get('source_type')}")
+    print(f"  Package:          {target.get('package_path')}")
+    print(f"  Package checksum: {target.get('package_checksum', '(legacy)')}")
+
+    if target.get("confirmed_at"):
+        print(f"\n[Confirmation]")
+        print(f"  Confirmed at:     {target.get('confirmed_at')}")
+        print(f"  Confirmed by:     {target.get('confirmed_by')}")
+
+    pkg = target.get("package")
+    if pkg:
+        print(f"\n[Upgrade Impact]")
+        impact = pkg.get("impact", {}).get("summary", {})
+        print(f"  Auto-migratable:   {impact.get('auto_migratable_count', 0)}")
+        print(f"  Confirmation rollback: {impact.get('confirmation_rollback_count', 0)}")
+        print(f"  Manual decisions:  {impact.get('manual_decision_count', 0)}")
+        print(f"  Decisions log:    {len(pkg.get('decisions_log', []))} entries")
+        print()
+        print(f"  Old rules ver:    {str(pkg.get('old_rules_version', ''))[:16]}...")
+        print(f"  New rules ver:    {str(pkg.get('new_rules_version', ''))[:16]}...")
+
+    conflicts = target.get("conflicts", [])
+    if conflicts:
+        print(f"\n[Conflicts Detected] ({len(conflicts)})")
+        for i, c in enumerate(conflicts, 1):
+            sev_tag = {
+                "high": "[HIGH]",
+                "medium": "[MED]",
+                "low": "[LOW]",
+            }.get(c.get("severity", "medium"), "[MED]")
+            print(f"  {i}. {sev_tag} {c['type']}: {c['message']}")
+            opts = c.get("resolution_options", [])
+            if opts:
+                print(f"     Options: {', '.join(opts)}")
+
+    decisions = target.get("decisions_log", [])
+    if decisions:
+        print(f"\n[Conflict Decisions Applied]")
+        for d in decisions:
+            print(f"  [{d.get('ts')}] {d.get('conflict_type')}: {d.get('decision')}"
+                  f" - {d.get('detail', '')}")
+
+    if target.get("resumed_across_restart"):
+        print(f"\n[Cross-Restart]")
+        print(f"  This session has been RESUMED after a process restart.")
+
+    print(f"\n{'=' * 70}")
+    if is_pending:
+        print(f"STATUS: PENDING CONFIRMATION")
+        print(f"  Confirm:  release_cli.py --state {state_path} rules_upgrade_handover_confirm")
+        print(f"  Revoke:   release_cli.py --state {state_path} rules_upgrade_handover_revoke")
+    else:
+        print(f"STATUS: CONFIRMED (persisted in imported_rules_upgrade_packages")
+    print(f"{'=' * 70}")
+    print()
+
+
+def cmd_rules_upgrade_handover_confirm(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    state.setdefault("rules_upgrade_handover_history", [])
+    state.setdefault("imported_rules_upgrade_packages", [])
+
+    pending = state.get("pending_rules_upgrade_import")
+    if not pending:
+        print("[ERROR] No pending rules upgrade handover import found.")
+        print("  Run 'rules_upgrade_import_package' first.")
+        sys.exit(1)
+
+    import_id = pending.get("import_id", "?")
+    operator = getattr(args, "operator", None) or _get_identity()
+    package = pending.get("package")
+    upgrade_id = pending.get("upgrade_id")
+
+    existing_imports = state.get("imported_rules_upgrade_packages", [])
+    duplicate = None
+    for imp in existing_imports:
+        if imp.get("upgrade_id") == upgrade_id and not imp.get("revoked"):
+            duplicate = imp
+            break
+
+    if duplicate and not args.force:
+        print(f"[BLOCKED] Upgrade {upgrade_id} already imported and confirmed.")
+        print(f"  Confirmed at: {duplicate.get('confirmed_at')}")
+        print(f"  Confirmed by: {duplicate.get('confirmed_by')}")
+        print(f"  Use --force to override (will mark previous as revoked and apply this one).")
+        sys.exit(1)
+
+    if duplicate and args.force:
+        duplicate["revoked"] = True
+        duplicate["revoked_at"] = datetime.now().isoformat()
+        duplicate["revoked_by"] = operator
+        duplicate["revoke_reason"] = "re-imported with --force"
+        _audit(state, "rules_upgrade_handover_revoked",
+               f"import_id={duplicate.get('import_id')} operator={operator} reason=re-imported")
+
+    decision_mode = getattr(args, "decision", "override_all")
+    per_item_raw = getattr(args, "per_item", None)
+    per_item_decision = {}
+    if per_item_raw:
+        for pair in per_item_raw.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                per_item_decision[k.strip()] = v.strip()
+
+    decisions_log = pending.setdefault("decisions_log", [])
+    ts_now = datetime.now().isoformat()
+
+    for conflict in pending.get("conflicts", []):
+        ctype = conflict.get("type")
+        per_key = f"conflict:{ctype}"
+        if per_key in per_item_decision:
+            dec = per_item_decision[per_key]
+        elif decision_mode == "override_all":
+            dec = "override"
+        elif decision_mode == "skip_all":
+            dec = "skip"
+        else:
+            dec = "override"
+
+        opts = conflict.get("resolution_options", ["override"])
+        if dec not in opts and "override" in opts:
+            dec = "override"
+        decisions_log.append({
+            "ts": ts_now,
+            "conflict_type": ctype,
+            "decision": dec,
+            "operator": operator,
+            "detail": f"conflict={ctype} decision={dec} mode={decision_mode}",
+        })
+
+    upgrade_snapshot = package["source_upgrade_snapshot"]
+    old_rules = upgrade_snapshot.get("old_rules_snapshot") or upgrade_snapshot.get("rules_snapshot")
+    new_rules = upgrade_snapshot.get("new_rules_snapshot")
+    impact = upgrade_snapshot.get("impact")
+    decisions = copy.deepcopy(package.get("decisions", {}))
+
+    manual_items = impact.get("manual_decision_required", [])
+    if manual_items and per_item_decision:
+        for m in manual_items:
+            iid = m.get("item_id")
+            field = m.get("field")
+            key = f"{m['type']}:{iid}:{field}"
+            pi_key = f"{iid}.{field}"
+
+            if pi_key in per_item_decision:
+                val = per_item_decision[pi_key]
+                decisions[key] = {"action": "set", "value": val}
+                decisions_log.append({
+                    "ts": ts_now,
+                    "type": m["type"],
+                    "item_id": iid,
+                    "field": field,
+                    "decision": f"set={val}",
+                    "operator": operator,
+                    "detail": f"per-item: {iid}.{field} = {val}",
+                })
+
+    if per_item_decision:
+        for pi_key, val in per_item_decision.items():
+            if "." not in pi_key:
+                continue
+            iid, field = pi_key.split(".", 1)
+            already_applied = any(
+                (d.get("item_id") == iid and d.get("field") == field)
+                for d in decisions_log
+            )
+            if already_applied:
+                continue
+            target = _find_in_list(state.get("items", []), iid)
+            if target:
+                old_val = target.get(field)
+                target[field] = val
+                _bump_item_version(target, operator=operator)
+                decisions_log.append({
+                    "ts": ts_now,
+                    "type": "per_item_override",
+                    "item_id": iid,
+                    "field": field,
+                    "decision": f"set={val}",
+                    "operator": operator,
+                    "detail": f"per-item override: {iid}.{field} {old_val} -> {val}",
+                })
+
+    pre_upgrade_state = copy.deepcopy(state)
+    _apply_rules_upgrade_to_state(state, old_rules, new_rules, impact, decisions, operator)
+
+    if state.get("approved"):
+        state["approved"] = False
+        state["approved_at_version"] = None
+        state["approved_at_draft_version"] = None
+        print("  [NOTE] Approval cleared (rules changed after approval).")
+
+    import_record = {
+        "import_id": import_id,
+        "imported_at": pending.get("imported_at"),
+        "imported_by": pending.get("imported_by"),
+        "import_pid": pending.get("import_pid"),
+        "upgrade_id": upgrade_id,
+        "exported_at": pending.get("exported_at"),
+        "exported_by": pending.get("exported_by"),
+        "package_path": pending.get("package_path"),
+        "package_checksum": pending.get("package_checksum"),
+        "source_type": pending.get("source_type"),
+        "package": copy.deepcopy(package),
+        "conflicts": pending.get("conflicts", []),
+        "decisions_log": decisions_log,
+        "pre_import_state": pre_upgrade_state,
+        "status": "confirmed",
+        "confirmed": True,
+        "confirmed_at": datetime.now().isoformat(),
+        "confirmed_by": operator,
+        "revoked": False,
+        "revoked_at": None,
+        "revoked_by": None,
+        "revoke_reason": None,
+        "resumed_across_restart": pending.get("resumed_across_restart", False),
+    }
+
+    state["imported_rules_upgrade_packages"].append(import_record)
+    state["rules_upgrade_handover_history"].append({
+        "type": "import",
+        "import_id": import_id,
+        "upgrade_id": upgrade_id,
+        "imported_at": import_record["imported_at"],
+        "imported_by": operator,
+        "exported_by": pending.get("exported_by"),
+        "confirmed_at": import_record["confirmed_at"],
+        "package_checksum": pending.get("package_checksum"),
+        "revoked": False,
+    })
+
+    upgrade_record = {
+        "upgrade_id": upgrade_id,
+        "applied_at": import_record["confirmed_at"],
+        "applied_by": operator,
+        "old_rules_snapshot": copy.deepcopy(old_rules),
+        "new_rules_snapshot": copy.deepcopy(new_rules),
+        "old_rules_version": package.get("old_rules_version"),
+        "new_rules_version": package.get("new_rules_version"),
+        "rules_diff": package.get("rules_diff"),
+        "impact": package.get("impact"),
+        "decisions": decisions,
+        "decisions_log": package.get("decisions_log", []),
+        "pre_upgrade_state_snapshot": {
+            "confirmations": copy.deepcopy(pre_upgrade_state.get("confirmations", {})),
+            "items": copy.deepcopy(pre_upgrade_state.get("items", [])),
+            "approved": pre_upgrade_state.get("approved", False),
+            "approved_at_version": pre_upgrade_state.get("approved_at_version"),
+            "approved_at_draft_version": pre_upgrade_state.get("approved_at_draft_version"),
+            "rules_version": pre_upgrade_state.get("rules_version"),
+            "rules_snapshot": copy.deepcopy(pre_upgrade_state.get("rules_snapshot")),
+        },
+        "status": "applied",
+        "revoked": False,
+        "revoked_at": None,
+        "revoked_by": None,
+        "revoke_reason": None,
+        "handover_import_id": import_id,
+        "handover_exported_by": pending.get("exported_by"),
+    }
+
+    state.setdefault("rules_upgrade_history", []).append(upgrade_record)
+    state["pending_rules_upgrade_import"] = None
+
+    _audit(state, "rules_upgrade_handover_confirmed",
+           f"import_id={import_id} operator={operator} "
+           f"upgrade_id={upgrade_id} "
+           f"decisions={len(decisions_log)} conflicts={len(pending.get('conflicts', []))} "
+           f"exported_by={pending.get('exported_by')}")
+
+    save_state(state, state_path)
+
+    print(f"\n{'=' * 70}")
+    print(f"RULES UPGRADE HANDOVER CONFIRMED")
+    print(f"{'=' * 70}")
+    print(f"  Import ID:        {import_id}")
+    print(f"  Upgrade ID:      {upgrade_id}")
+    print(f"  Confirmed at:   {import_record['confirmed_at']}")
+    print(f"  Confirmed by:   {operator}")
+    print(f"  Source type:     {pending.get('source_type')}")
+    print(f"  Conflicts resolved: {len(pending.get('conflicts', []))}")
+    if decisions_log:
+        print(f"  Decisions applied:  {len(decisions_log)}")
+    print(f"  Rules version:    {str(package.get('old_rules_version', ''))[:16]}... -> {str(package.get('new_rules_version', ''))[:16]}...")
+    print()
+    print(f"  Session is now PERSISTED (cross-restart safe).")
+    print(f"  Entry added to imported_rules_upgrade_packages and rules_upgrade_history.")
+    print(f"  Full package preserved with handover traces.")
+    print()
+    print(f"  Next steps:")
+    print(f"     release_cli.py --state {state_path} status")
+    print(f"     release_cli.py --state {state_path} rules_history")
+    print(f"{'=' * 70}")
+    print()
+
+
+def cmd_rules_upgrade_handover_revoke(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    state.setdefault("rules_upgrade_handover_history", [])
+    state.setdefault("imported_rules_upgrade_packages", [])
+
+    import_id = getattr(args, "import_id", None)
+    reason = getattr(args, "reason", "") or "manual revocation"
+    operator = getattr(args, "operator", None) or _get_identity()
+    force = getattr(args, "force", False)
+
+    pending = state.get("pending_rules_upgrade_import")
+    if pending and (import_id is None or pending.get("import_id") == import_id):
+        tid = pending.get("import_id", "?")
+        print(f"\n[Revoking PENDING HANDOVER IMPORT] {tid}")
+        print(f"  Reason: {reason}")
+
+        _audit(state, "rules_upgrade_handover_revoked_pending",
+               f"import_id={tid} operator={operator} reason={reason}")
+
+        pre_import_state = pending.get("pre_import_state")
+        if pre_import_state is None:
+            state["pending_rules_upgrade_import"] = None
+            save_state(state, state_path)
+            print(f"  Pending handover import removed.")
+        else:
+            restored = copy.deepcopy(pre_import_state)
+            restored["rules_upgrade_handover_history"] = state.get("rules_upgrade_handover_history", [])
+            restored["imported_rules_upgrade_packages"] = state.get("imported_rules_upgrade_packages", [])
+            restored["audit_log"] = state.get("audit_log", [])
+            restored["pending_rules_upgrade_import"] = None
+            _audit(restored, "rules_upgrade_handover_revoked_pending_restore",
+                   f"import_id={tid} operator={operator} reason={reason}")
+            save_state(restored, state_path)
+            print(f"  Pending handover import removed. Pre-import state restored.")
+
+        print(f"[OK] Pending handover import {tid} revoked successfully.")
+        print()
+        return
+
+    target_id = import_id
+    if target_id is None:
+        imp_ids = [imp["import_id"] for imp in state.get("imported_rules_upgrade_packages", []) if not imp.get("revoked")]
+        if not imp_ids:
+            print("[ERROR] No pending import and no confirmed imports to revoke.")
+            sys.exit(1)
+        target_id = imp_ids[-1]
+
+    target = None
+    for imp in state.get("imported_rules_upgrade_packages", []):
+        if imp.get("import_id") == target_id:
+            target = imp
+            break
+
+    if not target:
+        print(f"[ERROR] Confirmed handover import import_id={target_id} not found.")
+        sys.exit(1)
+
+    if not force:
+        print(f"[WARNING] You are revoking a CONFIRMED (persisted) handover import.")
+        print(f"  Import ID: {target_id}")
+        print(f"  Upgrade ID: {target.get('upgrade_id')}")
+        print(f"  Confirmed at: {target.get('confirmed_at')}")
+        print(f"  Confirmed by: {target.get('confirmed_by')}")
+        print(f"  This will rollback state to pre-import snapshot (if available).")
+        print(f"  Re-run with --force to proceed, or --import-id to pick another.")
+        sys.exit(1)
+
+    tid = target_id
+    print(f"\n[Revoking CONFIRMED HANDOVER IMPORT] {tid}")
+    print(f"  Reason: {reason}")
+    print(f"  Force:  yes")
+
+    ts_now = datetime.now().isoformat()
+    target["revoked"] = True
+    target["revoked_at"] = ts_now
+    target["revoked_by"] = operator
+    target["revoke_reason"] = reason
+
+    for hist in state.get("rules_upgrade_handover_history", []):
+        if hist.get("import_id") == tid:
+            hist["revoked"] = True
+            hist["revoked_at"] = ts_now
+            hist["revoked_by"] = operator
+            hist["revoke_reason"] = reason
+            break
+
+    for upg in state.get("rules_upgrade_history", []):
+        if upg.get("handover_import_id") == tid and not upg.get("revoked"):
+            upg["revoked"] = True
+            upg["revoked_at"] = ts_now
+            upg["revoked_by"] = operator
+            upg["revoke_reason"] = reason
+            break
+
+    _audit(state, "rules_upgrade_handover_revoked_confirmed",
+           f"import_id={tid} operator={operator} reason={reason}")
+
+    pre_import = target.get("pre_import_state")
+    if pre_import is not None:
+        restored = copy.deepcopy(pre_import)
+        restored["rules_upgrade_handover_history"] = state.get("rules_upgrade_handover_history", [])
+        restored["imported_rules_upgrade_packages"] = state.get("imported_rules_upgrade_packages", [])
+        restored["rules_upgrade_history"] = state.get("rules_upgrade_history", [])
+        restored["audit_log"] = state.get("audit_log", [])
+        restored["pending_rules_upgrade_import"] = None
+        _audit(restored, "rules_upgrade_handover_revoked_confirmed_rollback",
+               f"import_id={tid} operator={operator} reason={reason}")
+        save_state(restored, state_path)
+        print(f"  State rolled back to pre-import snapshot.")
+    else:
+        save_state(state, state_path)
+        print(f"  Session marked revoked. (No pre-import snapshot available for rollback)")
+
+    print(f"[OK] Confirmed handover import {tid} revoked successfully.")
+    print()
+
+
+def _render_markdown(state):
+    lines = []
+    v = state.get("version", "UNKNOWN")
+    lines.append(f"# Release Notes v{v}")
+    lines.append("")
+
+    lines.append("## Overview")
+    lines.append("")
+    lines.append(f"Version **{v}** release notes. Please review all sections before approval.")
+    lines.append("")
+
+    lines.append("## Changes")
+    lines.append("")
+    items = state.get("items", [])
+    if items:
+        by_cat = {}
+        for it in items:
+            cat = it.get("category", "other")
+            by_cat.setdefault(cat, []).append(it)
+        for cat, group in sorted(by_cat.items()):
+            lines.append(f"### {cat.upper()}")
+            lines.append("")
+            for it in group:
+                risk = it.get("risk_level", "unknown")
+                owner = it.get("owner") or "(missing owner)"
+                lines.append(f"- **{it.get('id', '?')}** {it.get('title', '')} `risk:{risk}` `owner:{owner}`")
+                desc = it.get("description", "")
+                if desc:
+                    lines.append(f"  > {desc}")
+            lines.append("")
+    else:
+        lines.append("_No change items imported yet._")
+        lines.append("")
+
+    lines.append("## Migration")
+    lines.append("")
+    migs = state.get("migration_reminders", [])
+    if migs:
+        for m in migs:
+            mid = m.get("id", "?")
+            processed = state.get("migration_processed", {}).get(mid, False)
+            status_tag = "[PROCESSED]" if processed else "[PENDING]"
+            lines.append(f"- **{mid}** {m.get('title', '')} {status_tag}")
+            lines.append(f"  > {m.get('description', '')}")
+            ar = m.get("action_required", "")
+            if ar:
+                lines.append(f"  - Action: {ar}")
+            lines.append("")
+    else:
+        lines.append("_No migration reminders._")
+        lines.append("")
+
+    lines.append("## Known Issues")
+    lines.append("")
+    kis = state.get("known_issues", [])
+    if kis:
+        reviewed = state.get("known_issues_reviewed", False)
+        tag = "[REVIEWED]" if reviewed else "[NOT REVIEWED]"
+        lines.append(f"_Status: {tag}_")
+        lines.append("")
+        for ki in kis:
+            lines.append(f"- **{ki.get('id', '?')}** {ki.get('title', '')}")
+            lines.append(f"  > {ki.get('description', '')}")
+            wa = ki.get("workaround", "")
+            if wa:
+                lines.append(f"  - Workaround: {wa}")
+            lines.append("")
+    else:
+        lines.append("_No known issues._")
+        lines.append("")
+
+    handover_imports = state.get("imported_rules_upgrade_packages", [])
+    active_imports = [imp for imp in handover_imports if not imp.get("revoked")]
+    revoked_imports = [imp for imp in handover_imports if imp.get("revoked")]
+
+    if active_imports or revoked_imports:
+        lines.append("## Rules Upgrade Handover History")
+        lines.append("")
+        lines.append("### Active Imports")
+        lines.append("")
+        if active_imports:
+            for imp in active_imports:
+                lines.append(f"- **{imp.get('import_id')}** (Upgrade ID: {imp.get('upgrade_id')})")
+                lines.append(f"  - Exported by: {imp.get('exported_by')} @ {imp.get('exported_at')}")
+                lines.append(f"  - Imported by: {imp.get('imported_by')} @ {imp.get('imported_at')}")
+                lines.append(f"  - Confirmed by: {imp.get('confirmed_by')} @ {imp.get('confirmed_at')}")
+                lines.append(f"  - Rules: {str(imp.get('package', {}).get('old_rules_version', ''))[:16]}... -> {str(imp.get('package', {}).get('new_rules_version', ''))[:16]}...")
+                lines.append(f"  - Decisions: {len(imp.get('decisions_log', []))} applied")
+                conflicts = imp.get("conflicts", [])
+                if conflicts:
+                    lines.append(f"  - Conflicts resolved: {len(conflicts)}")
+                lines.append("")
+        else:
+            lines.append("_No active handover imports._")
+            lines.append("")
+
+        if revoked_imports:
+            lines.append("### Revoked Imports")
+            lines.append("")
+            for imp in revoked_imports:
+                lines.append(f"- ~~{imp.get('import_id')}~~ (Upgrade ID: {imp.get('upgrade_id')})")
+                lines.append(f"  - Revoked by: {imp.get('revoked_by')} @ {imp.get('revoked_at')}")
+                lines.append(f"  - Reason: {imp.get('revoke_reason')}")
+                lines.append("")
+
+    rules_upgrades = state.get("rules_upgrade_history", [])
+    active_upgrades = [u for u in rules_upgrades if not u.get("revoked")]
+    revoked_upgrades = [u for u in rules_upgrades if u.get("revoked")]
+
+    if active_upgrades or revoked_upgrades:
+        lines.append("## Rules Upgrade History")
+        lines.append("")
+        lines.append("### Applied Upgrades")
+        lines.append("")
+        if active_upgrades:
+            for u in active_upgrades:
+                handover_tag = ""
+                if u.get("handover_import_id"):
+                    handover_tag = f" (via handover import {u.get('handover_import_id')} from {u.get('handover_exported_by')})"
+                lines.append(f"- **{u.get('upgrade_id')}**{handover_tag}")
+                lines.append(f"  - Applied by: {u.get('applied_by')} @ {u.get('applied_at')}")
+                lines.append(f"  - Rules: {str(u.get('old_rules_version', ''))[:16]}... -> {str(u.get('new_rules_version', ''))[:16]}...")
+                impact = u.get("impact", {}).get("summary", {})
+                lines.append(f"  - Impact: auto={impact.get('auto_migratable_count', 0)} rollback={impact.get('confirmation_rollback_count', 0)} manual={impact.get('manual_decision_count', 0)}")
+                lines.append("")
+        else:
+            lines.append("_No applied rules upgrades._")
+            lines.append("")
+
+        if revoked_upgrades:
+            lines.append("### Revoked Upgrades")
+            lines.append("")
+            for u in revoked_upgrades:
+                lines.append(f"- ~~{u.get('upgrade_id')}~~")
+                lines.append(f"  - Revoked by: {u.get('revoked_by')} @ {u.get('revoked_at')}")
+                lines.append(f"  - Reason: {u.get('revoke_reason')}")
+                lines.append("")
+
+    lines.append("---")
+    lines.append(f"_Generated at {datetime.now().isoformat()} | Draft v{state.get('draft_version', 0)}_")
+    return "\n".join(lines)
+
+
 def main():
     try:
         if hasattr(sys.stdout, "reconfigure"):
@@ -4266,6 +5485,46 @@ def main():
 
     p_rules_hist = sub.add_parser("rules_history", help="Show rules upgrade history - applied, revoked, pending")
 
+    p_export_ru_pkg = sub.add_parser("export_rules_upgrade_package", help="Export rules upgrade handover package - decision context, conflicts, rules snapshot")
+    p_export_ru_pkg.add_argument("--upgrade-source", default="pending",
+                                  help="Source of upgrade: 'pending' (default) or upgrade_id or 'latest' for applied")
+    p_export_ru_pkg.add_argument("-o", "--output", help="Output package file path (.json)")
+    p_export_ru_pkg.add_argument("--operator", help="Operator identifier (for audit)")
+    p_export_ru_pkg.add_argument("--description", help="Description of this handover package")
+    p_export_ru_pkg.add_argument("--note", help="Operator note for receiver")
+    p_export_ru_pkg.add_argument("--no-rules", action="store_true",
+                                  help="Exclude rules.yaml snapshot from package")
+
+    p_import_ru_pkg = sub.add_parser("import_rules_upgrade_package", help="Import rules upgrade handover package - reconcile, detect conflicts")
+    p_import_ru_pkg.add_argument("package", help="Path to rules upgrade handover package .json file")
+    p_import_ru_pkg.add_argument("--operator", help="Operator identifier (for audit)")
+    p_import_ru_pkg.add_argument("--force", action="store_true",
+                                  help="Force re-import even if same upgrade_id already imported")
+    p_import_ru_pkg.add_argument("--apply-rules-snapshot", action="store_true",
+                                  help="Apply rules snapshot from package to local rules.yaml during reconcile")
+
+    p_ru_handoff_detail = sub.add_parser("rules_upgrade_handover_detail", help="Show rules upgrade handover detail - conflicts, decisions, import status")
+    p_ru_handoff_detail.add_argument("--import-id", default=None, help="Specific import_id to view (default: latest pending or latest confirmed)")
+
+    p_ru_handoff_confirm = sub.add_parser("rules_upgrade_handover_confirm", help="Confirm pending rules upgrade handover import - apply upgrade, persist records")
+    p_ru_handoff_confirm.add_argument("--operator", help="Operator identifier (for audit & decision log)")
+    p_ru_handoff_confirm.add_argument("--force", action="store_true",
+                                       help="Force confirm even if same upgrade_id already imported (will revoke previous)")
+    p_ru_handoff_confirm.add_argument("--decision",
+                                       choices=["override_all", "skip_all"],
+                                       default="override_all",
+                                       help="Default conflict resolution strategy")
+    p_ru_handoff_confirm.add_argument("--per-item", default=None, metavar="conflict:TYPE=DEC,...",
+                                       help=("Per-conflict-type overrides "
+                                             "(e.g. conflict:rules_differs=skip,conflict:item_state_diverged=override)"))
+
+    p_ru_handoff_revoke = sub.add_parser("rules_upgrade_handover_revoke", help="Revoke/undo rules upgrade handover import (pending or confirmed)")
+    p_ru_handoff_revoke.add_argument("--import-id", default=None, help="Specific import_id to revoke (default: pending or latest confirmed)")
+    p_ru_handoff_revoke.add_argument("--reason", default="", help="Reason for revocation (written to audit log)")
+    p_ru_handoff_revoke.add_argument("--operator", help="Operator identifier (for audit)")
+    p_ru_handoff_revoke.add_argument("--force", action="store_true",
+                                       help="Required to revoke a confirmed (persisted) handover import")
+
     args = parser.parse_args()
     rules = load_rules(args.rules)
 
@@ -4293,6 +5552,11 @@ def main():
         "rules_upgrade_skip": cmd_rules_upgrade_skip,
         "rules_upgrade_undo": cmd_rules_upgrade_undo,
         "rules_history": cmd_rules_history,
+        "export_rules_upgrade_package": cmd_export_rules_upgrade_package,
+        "import_rules_upgrade_package": cmd_import_rules_upgrade_package,
+        "rules_upgrade_handover_detail": cmd_rules_upgrade_handover_detail,
+        "rules_upgrade_handover_confirm": cmd_rules_upgrade_handover_confirm,
+        "rules_upgrade_handover_revoke": cmd_rules_upgrade_handover_revoke,
     }
 
     fn = dispatch.get(args.command)
