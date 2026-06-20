@@ -19,19 +19,65 @@ FAIL = 0
 
 def run_cli(args, state_path, expect_fail=False):
     cmd = [sys.executable, CLI, "--rules", RULES, "--state", state_path] + args
-    res = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8:replace"
+    res = subprocess.run(cmd, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", cwd=SCRIPT_DIR, env=env)
     ok = res.returncode != 0 if expect_fail else res.returncode == 0
     if not ok:
-        print(f"  [FAIL] {' '.join(args)}")
-        print(f"    exit={res.returncode} expect_fail={expect_fail}")
+        safe_print(f"  [FAIL] {' '.join(args)}")
+        safe_print(f"    exit={res.returncode} expect_fail={expect_fail}")
         if res.stdout.strip():
-            print(f"    stdout: {res.stdout.strip()}")
+            safe_print(f"    stdout: {safe_truncate(res.stdout)}")
         if res.stderr.strip():
-            print(f"    stderr: {res.stderr.strip()}")
+            safe_print(f"    stderr: {safe_truncate(res.stderr)}")
     else:
         label = "(expected fail)" if expect_fail else ""
-        print(f"  [OK] {' '.join(args)} {label}")
+        safe_print(f"  [OK] {' '.join(args)} {label}")
     return res
+
+
+def run_cli_utf8(args, state_path, expect_fail=False):
+    """调用 CLI 时显式加 -X utf8，模拟 Python UTF-8 模式"""
+    cmd = [sys.executable, "-X", "utf8", CLI, "--rules", RULES, "--state", state_path] + args
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8:replace"
+    res = subprocess.run(cmd, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", cwd=SCRIPT_DIR, env=env)
+    ok = res.returncode != 0 if expect_fail else res.returncode == 0
+    if not ok:
+        safe_print(f"  [FAIL -X utf8] {' '.join(args)}")
+        safe_print(f"    exit={res.returncode} expect_fail={expect_fail}")
+        if res.stdout.strip():
+            safe_print(f"    stdout: {safe_truncate(res.stdout)}")
+        if res.stderr.strip():
+            safe_print(f"    stderr: {safe_truncate(res.stderr)}")
+    else:
+        label = "(expected fail)" if expect_fail else ""
+        safe_print(f"  [OK -X utf8] {' '.join(args)} {label}")
+    return res
+
+
+def safe_truncate(s, limit=400):
+    if s is None:
+        return ""
+    safe = s.encode("ascii", errors="replace").decode("ascii", errors="replace")
+    if len(safe) > limit:
+        return safe[:limit] + f"... (total {len(s)} chars)"
+    return safe
+
+
+def safe_print(s):
+    try:
+        sys.stdout.write(s + "\n")
+        sys.stdout.flush()
+    except Exception:
+        try:
+            safe = s.encode("ascii", errors="replace").decode("ascii")
+            sys.stdout.write(safe + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
 
 def read_state(state_path):
@@ -48,36 +94,36 @@ def assert_eq(actual, expected, msg):
     global FAIL, PASS
     if actual == expected:
         PASS += 1
-        print(f"    [ASSERT OK] {msg}")
+        safe_print(f"    [ASSERT OK] {msg}")
     else:
         FAIL += 1
-        print(f"    [ASSERT FAIL] {msg}")
-        print(f"      expected: {expected!r}")
-        print(f"      actual:   {actual!r}")
+        safe_print(f"    [ASSERT FAIL] {msg}")
+        safe_print(f"      expected: {safe_truncate(repr(expected))}")
+        safe_print(f"      actual:   {safe_truncate(repr(actual))}")
 
 
 def assert_in(needle, haystack, msg):
     global FAIL, PASS
     if needle in haystack:
         PASS += 1
-        print(f"    [ASSERT OK] {msg}")
+        safe_print(f"    [ASSERT OK] {msg}")
     else:
         FAIL += 1
-        print(f"    [ASSERT FAIL] {msg}")
-        print(f"      missing: {needle!r}")
-        print(f"      in: {haystack[:200]!r}")
+        safe_print(f"    [ASSERT FAIL] {msg}")
+        safe_print(f"      missing: {safe_truncate(repr(needle))}")
+        safe_print(f"      in: {safe_truncate(repr(haystack[:200] if isinstance(haystack, (str, list, dict)) else haystack))}")
 
 
 def assert_not_in(needle, haystack, msg):
     global FAIL, PASS
     if needle not in haystack:
         PASS += 1
-        print(f"    [ASSERT OK] {msg}")
+        safe_print(f"    [ASSERT OK] {msg}")
     else:
         FAIL += 1
-        print(f"    [ASSERT FAIL] {msg}")
-        print(f"      unexpected: {needle!r}")
-        print(f"      in: {haystack[:200]!r}")
+        safe_print(f"    [ASSERT FAIL] {msg}")
+        safe_print(f"      unexpected: {safe_truncate(repr(needle))}")
+        safe_print(f"      in: {safe_truncate(repr(haystack[:200] if isinstance(haystack, (str, list, dict)) else haystack))}")
 
 
 def cleanup_patterns(workdir, state_filename=None):
@@ -2103,9 +2149,12 @@ from release_cli import main as cli_main
 sys.argv = ["release_cli.py", "--state", r"{sp_b}", "audit_view"]
 cli_main()
 """)
+    env_spb = os.environ.copy()
+    env_spb["PYTHONIOENCODING"] = "utf-8:replace"
     result = subprocess.run(
         [sys.executable, audit_script],
-        capture_output=True
+        capture_output=True,
+        env=env_spb
     )
     audit_output = result.stdout.decode('utf-8', errors='ignore') + result.stderr.decode('utf-8', errors='ignore')
 
@@ -2243,9 +2292,12 @@ from release_cli import main as cli_main
 sys.argv = ["release_cli.py", "--state", r"{sp_b}", "audit_view"]
 cli_main()
 """)
+    env_spb = os.environ.copy()
+    env_spb["PYTHONIOENCODING"] = "utf-8:replace"
     result = subprocess.run(
         [sys.executable, audit_script],
-        capture_output=True
+        capture_output=True,
+        env=env_spb
     )
     audit_output = result.stdout.decode('utf-8', errors='ignore') + result.stderr.decode('utf-8', errors='ignore')
 
@@ -2894,7 +2946,10 @@ from release_cli import main as cli_main
 sys.argv = ["release_cli.py", "--rules", r"{RULES}", "--state", r"{sp_m2}", "audit_view"]
 cli_main()
 """)
-    res_subp = subprocess.run([sys.executable, audit_script], capture_output=True, text=True)
+    env43 = os.environ.copy()
+    env43["PYTHONIOENCODING"] = "utf-8:replace"
+    res_subp = subprocess.run([sys.executable, audit_script], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", env=env43)
     subp_out = res_subp.stdout + res_subp.stderr
 
     assert_in("Cross-restart:  YES", subp_out, "t43 restarted audit_view shows Cross-restart YES")
@@ -2966,10 +3021,206 @@ cli_main()
     cleanup_patterns(tmpdir, "state_t43_machine2.json")
 
 
+def test_44_utf8_mode_encoding_stability(tmpdir):
+    """Test 44: python -X utf8 下 audit_view/详情/跨重启/撤销恢复 的编码稳定性"""
+    safe_print("\n" + "=" * 60)
+    safe_print("TEST 44: UTF-8 模式编码稳定性（audit_view/详情/跨重启/撤销）")
+    safe_print("=" * 60)
+
+    SAMPLE = os.path.join(SCRIPT_DIR, "sample_manifest.json")
+
+    # ========== Part 1: A 导出包 ==========
+    safe_print("\n  [Part 1] Machine A 构造包（2章节确认）...")
+    sp_a = os.path.join(tmpdir, "state_t44_a.json")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli(["draft"], sp_a)
+    run_cli(["amend", "CHG-003", "--field", "owner=王五-t44"], sp_a)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp_a)
+    run_cli(["confirm", "overview"], sp_a)
+    run_cli(["confirm", "changes"], sp_a)
+
+    pkg44 = os.path.join(tmpdir, "pkg_t44.json")
+    run_cli(["export_package", "-o", pkg44, "--operator", "源机负责人-44"], sp_a)
+
+    # ========== Part 2: B 导入对账 ==========
+    safe_print("\n  [Part 2] Machine B 导入对账（只读 pending）...")
+    sp_b = os.path.join(tmpdir, "state_t44_b.json")
+    run_cli(["import", SAMPLE], sp_b)
+    run_cli(["draft"], sp_b)
+    run_cli(["import_package", pkg44, "--mode", "takeover", "--operator", "接管人B-44"], sp_b)
+
+    # ========== Part 3: -X utf8 下 audit_view 中文输出 ==========
+    safe_print("\n  [Part 3] python -X utf8 调用 audit_view（pending 状态）...")
+    res_audit_pending = run_cli_utf8(["audit_view"], sp_b)
+    assert res_audit_pending.returncode == 0, "t44 -X utf8 audit_view(pending) exit=0"
+    assert len(res_audit_pending.stdout) > 100, "t44 -X utf8 audit_view(pending) stdout 非空"
+    assert_in("[PENDING]", res_audit_pending.stdout, "t44 pending audit_view has [PENDING] tag")
+    assert_in("AUDIT VIEW", res_audit_pending.stdout, "t44 pending audit_view has AUDIT VIEW header")
+    pending_has_zh = any('\u4e00' <= c <= '\u9fff' for c in res_audit_pending.stdout)
+    assert pending_has_zh, "t44 pending audit_view(-X utf8) 含中文字符"
+    safe_print(f"  [OK] -X utf8 audit_view(pending): {len(res_audit_pending.stdout)} bytes, 中文={pending_has_zh}")
+
+    # ========== Part 4: -X utf8 下 takeover_detail 详情查看 ==========
+    safe_print("\n  [Part 4] python -X utf8 调用 takeover_detail...")
+    res_detail = run_cli_utf8(["takeover_detail"], sp_b)
+    assert res_detail.returncode == 0, "t44 -X utf8 takeover_detail exit=0"
+    assert len(res_detail.stdout) > 100, "t44 -X utf8 takeover_detail stdout 非空"
+    assert_in("TAKEOVER DETAIL:", res_detail.stdout, "t44 takeover_detail has header")
+    assert_in("[PENDING CONFIRMATION]", res_detail.stdout, "t44 takeover_detail has pending tag")
+    detail_has_zh = any('\u4e00' <= c <= '\u9fff' for c in res_detail.stdout)
+    assert detail_has_zh, "t44 takeover_detail(-X utf8) 含中文字符"
+    safe_print(f"  [OK] -X utf8 takeover_detail: {len(res_detail.stdout)} bytes, 中文={detail_has_zh}")
+
+    # ========== Part 5: 确认接管 → 模拟重启 → -X utf8 下 audit_view 跨重启检测 ==========
+    safe_print("\n  [Part 5] 确认接管，模拟跨重启，-X utf8 下检测 [RESUMED]...")
+    run_cli(["takeover_confirm", "--operator", "接管人B-44"], sp_b)
+
+    s_confirmed = read_state(sp_b)
+    tid44 = s_confirmed["takeover_history"][0]["takeover_id"]
+
+    # 做一些后续工作（confirmed_at 之后的非白名单事件）
+    run_cli(["confirm", "migration"], sp_b)
+    run_cli(["confirm", "known_issues"], sp_b)
+
+    # 改 session_pid = 99999 模拟重启
+    s_reload = read_state(sp_b)
+    s_reload["confirmed_takeover_sessions"][tid44]["session_pid"] = 99999
+    with open(sp_b, "w", encoding="utf-8") as f:
+        json.dump(s_reload, f, ensure_ascii=False, indent=2)
+
+    # 用 -X utf8 子进程调用 audit_view，检查跨重启检测
+    res_audit_resumed = run_cli_utf8(["audit_view"], sp_b)
+    assert res_audit_resumed.returncode == 0, "t44 -X utf8 audit_view(resumed) exit=0"
+    assert len(res_audit_resumed.stdout) > 100, "t44 -X utf8 audit_view(resumed) stdout 非空"
+    assert_in("Cross-restart:  YES", res_audit_resumed.stdout, "t44 resumed audit_view Cross-restart: YES")
+    assert_in("[RESUMED]", res_audit_resumed.stdout, "t44 resumed audit_view has [RESUMED] tag")
+    assert_in("[TAKEOVER]", res_audit_resumed.stdout, "t44 resumed audit_view has [TAKEOVER] tag")
+    resumed_has_zh = any('\u4e00' <= c <= '\u9fff' for c in res_audit_resumed.stdout)
+    assert resumed_has_zh, "t44 resumed audit_view(-X utf8) 含中文字符"
+    safe_print(f"  [OK] -X utf8 audit_view(resumed): {len(res_audit_resumed.stdout)} bytes, 中文={resumed_has_zh}")
+
+    # 读取更新后的 state，确认 resumed_count 增加（audit_view 内部会写入）
+    s_after_resumed = read_state(sp_b)
+    assert s_after_resumed["confirmed_takeover_sessions"][tid44]["resumed_count"] >= 1, "t44 resumed_count ≥1"
+    assert s_after_resumed["takeover_history"][0].get("resumed_across_restart") == True, "t44 resumed_flag=True"
+    safe_print("  [OK] 跨重启检测写入正确，resumed_count 增加")
+
+    # ========== Part 6: 重建 pending 状态 → -X utf8 下撤销 pending ==========
+    safe_print("\n  [Part 6] 重建 pending → -X utf8 下撤销待确认（pending revoke）...")
+    sp_c = os.path.join(tmpdir, "state_t44_c.json")
+    run_cli(["import", SAMPLE], sp_c)
+    run_cli(["draft"], sp_c)
+    run_cli(["import_package", pkg44, "--mode", "takeover", "--operator", "接管人C-44"], sp_c)
+
+    # 撤销前验证 pending 存在
+    s_before_revoke = read_state(sp_c)
+    assert s_before_revoke.get("pending_takeover") is not None, "t44 pending exists before revoke"
+    pre_items_before = s_before_revoke["pending_takeover"]["pre_import_state"]["items"]
+
+    # 用 -X utf8 模式撤销 pending
+    res_revoke_pending = run_cli_utf8(["takeover_revoke", "--operator", "撤销人C-44",
+                                         "--reason", "撤销待确认测试-44"], sp_c)
+    assert res_revoke_pending.returncode == 0, "t44 -X utf8 revoke pending exit=0"
+    assert_in("revoked successfully", res_revoke_pending.stdout, "t44 pending revoke msg ok")
+    assert any('\u4e00' <= c <= '\u9fff' for c in res_revoke_pending.stdout), "t44 pending revoke output 含中文"
+
+    # 验证 pending 清除，state 回滚到 pre_import
+    s_after_pending_revoke = read_state(sp_c)
+    assert s_after_pending_revoke.get("pending_takeover") is None, "t44 pending cleared after revoke"
+    assert len(s_after_pending_revoke.get("takeover_history", [])) == 0, "t44 no takeover history after pending revoke"
+    # pre_import 中 CHG-003 还没有 owner（因为对账前是原始 import + draft，没有 amend）
+    chg003_after = next(it for it in s_after_pending_revoke["items"] if it["id"] == "CHG-003")
+    assert chg003_after.get("owner") in [None, ""], "t44 CHG-003 owner rolled back after pending revoke"
+    safe_print("  [OK] pending 撤销：状态回滚，pending_takeover 清除，审计事件写入")
+
+    # ========== Part 7: 重建 confirmed → -X utf8 下撤销 confirmed（--force） ==========
+    safe_print("\n  [Part 7] 重建 confirmed → -X utf8 下撤销已确认（--force）...")
+    sp_d = os.path.join(tmpdir, "state_t44_d.json")
+    run_cli(["import", SAMPLE], sp_d)
+    run_cli(["draft"], sp_d)
+    run_cli(["import_package", pkg44, "--mode", "takeover", "--operator", "接管人D-44"], sp_d)
+    run_cli(["takeover_confirm", "--operator", "接管人D-44"], sp_d)
+
+    # 用 -X utf8 模式撤销 confirmed（必须 --force）
+    res_revoke_no_force = run_cli_utf8(["takeover_revoke", "--operator", "撤销人D-44",
+                                          "--reason", "撤销已确认测试-44"], sp_d, expect_fail=True)
+    assert res_revoke_no_force.returncode != 0, "t44 revoke confirmed without --force rejected"
+
+    # 加 --force 撤销
+    tid44_d = read_state(sp_d)["takeover_history"][0]["takeover_id"]
+    res_revoke_confirmed = run_cli_utf8(["takeover_revoke", "--operator", "撤销人D-44",
+                                           "--reason", "撤销已确认测试-44", "--force",
+                                           "--takeover-id", tid44_d], sp_d)
+    assert res_revoke_confirmed.returncode == 0, "t44 -X utf8 revoke confirmed(--force) exit=0"
+    assert_in("Revoking CONFIRMED TAKEOVER SESSION", res_revoke_confirmed.stdout, "t44 confirmed revoke msg 1")
+    assert_in("State rolled back", res_revoke_confirmed.stdout, "t44 confirmed revoke msg 2")
+    assert_in("revoked successfully", res_revoke_confirmed.stdout, "t44 confirmed revoke msg 3")
+
+    # 验证 takeover_history 和 sessions 保留 revoked=True
+    s_after_confirmed_revoke = read_state(sp_d)
+    assert len(s_after_confirmed_revoke.get("takeover_history", [])) == 1, "t44 confirmed revoke keeps 1 history entry"
+    assert s_after_confirmed_revoke["takeover_history"][0].get("revoked") == True, "t44 takeover revoked=True"
+    assert s_after_confirmed_revoke["takeover_history"][0].get("revoke_reason") == "撤销已确认测试-44", "t44 revoke_reason correct"
+    sessions_d = s_after_confirmed_revoke.get("confirmed_takeover_sessions", {})
+    assert len(sessions_d) == 1, "t44 confirmed revoke keeps session"
+    assert sessions_d[tid44_d]["revoked"] == True, "t44 session revoked=True"
+    assert sessions_d[tid44_d].get("revoke_reason") == "撤销已确认测试-44", "t44 session revoke_reason correct"
+
+    # 用 -X utf8 调 audit_view 验证 [REVOKED] 标签
+    res_audit_revoked = run_cli_utf8(["audit_view"], sp_d)
+    assert res_audit_revoked.returncode == 0, "t44 -X utf8 audit_view(revoked) exit=0"
+    assert_in("[REVOKED]", res_audit_revoked.stdout, "t44 revoked audit_view has [REVOKED] tag")
+    assert_in("[Revocation]", res_audit_revoked.stdout, "t44 revoked audit_view has [Revocation] section")
+    revoked_has_zh = any('\u4e00' <= c <= '\u9fff' for c in res_audit_revoked.stdout)
+    assert revoked_has_zh, "t44 revoked audit_view(-X utf8) 含中文字符"
+    safe_print(f"  [OK] -X utf8 audit_view(revoked): {len(res_audit_revoked.stdout)} bytes, 中文={revoked_has_zh}")
+    safe_print("  [OK] confirmed 撤销：takeover/sessions 保留 revoked=True，audit_view 正确显示 [REVOKED]")
+
+    # ========== Part 8: 验证 0 passed, 0 failed 防误判机制（附加验证） ==========
+    safe_print("\n  [Part 8] 验证 -X utf8 模式下 status 中文输出稳定...")
+    # 回到 sp_b（resumed 状态），用 -X utf8 调 status
+    res_status = run_cli_utf8(["status"], sp_b)
+    assert res_status.returncode == 0, "t44 -X utf8 status exit=0"
+    assert len(res_status.stdout) > 50, "t44 -X utf8 status stdout 非空"
+    assert_in("Active Takeover Sessions:", res_status.stdout, "t44 status shows active sessions")
+    status_has_zh = any('\u4e00' <= c <= '\u9fff' for c in res_status.stdout)
+    assert status_has_zh, "t44 status(-X utf8) 含中文字符"
+    safe_print(f"  [OK] -X utf8 status: {len(res_status.stdout)} bytes, 中文={status_has_zh}")
+
+    # 清理
+    cleanup_patterns(tmpdir, "state_t44_a.json")
+    cleanup_patterns(tmpdir, "state_t44_b.json")
+    cleanup_patterns(tmpdir, "state_t44_c.json")
+    cleanup_patterns(tmpdir, "state_t44_d.json")
+
+    safe_print("\n  [OK] ====== TEST 44 UTF-8 编码稳定性全部通过 ======")
+    safe_print("  1. -X utf8 audit_view(pending) 中文输出 ✅")
+    safe_print("  2. -X utf8 takeover_detail 详情 ✅")
+    safe_print("  3. -X utf8 audit_view(resumed) 跨重启检测 ✅")
+    safe_print("  4. -X utf8 pending revoke 撤销待确认 ✅")
+    safe_print("  5. -X utf8 confirmed revoke(--force) 撤销已确认 ✅")
+    safe_print("  6. -X utf8 status 中文输出 ✅")
+
+
 def main():
     global PASS, FAIL
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(errors="replace")
+            except Exception:
+                pass
+        if hasattr(sys.stderr, "reconfigure"):
+            try:
+                sys.stderr.reconfigure(errors="replace")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     tmpdir = tempfile.mkdtemp(prefix="release_cli_test_")
-    print(f"Test workspace: {tmpdir}")
+    safe_print(f"Test workspace: {tmpdir}")
+    fatal_exception = None
     try:
         test_1_rollback_after_approve(tmpdir)
         test_2_no_import_when_approved(tmpdir)
@@ -3014,13 +3265,38 @@ def main():
         test_41_conflict_detection_and_decisions(tmpdir)
         test_42_cross_restart_persisted_session(tmpdir)
         test_43_full_e2e_handoff_confirm_restart_approve(tmpdir)
-
-        print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
-        if FAIL:
-            sys.exit(1)
-        print("All tests passed.")
+        test_44_utf8_mode_encoding_stability(tmpdir)
+    except Exception as e:
+        fatal_exception = e
+        safe_print(f"\n*** FATAL EXCEPTION during tests: {type(e).__name__}: {e} ***")
+        import traceback
+        try:
+            tb_str = traceback.format_exc()
+            safe_print(safe_truncate(tb_str, 800))
+        except Exception:
+            pass
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            safe_print(f"\n==== SUMMARY: {PASS} passed, {FAIL} failed ====")
+            if fatal_exception is not None:
+                safe_print(f"[FATAL] Exception occurred, tests did not complete normally")
+                safe_print(f"[FATAL] This is NOT a pass - tests crashed before completion")
+            if PASS == 0 and FAIL == 0:
+                safe_print("[CRITICAL INTEGRITY ERROR] 0 passed and 0 failed - tests likely crashed or did not run")
+                safe_print("This result is invalid - a normal test run should have many passing assertions")
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                sys.exit(2)
+            if FAIL > 0 or fatal_exception is not None:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                sys.exit(1)
+            safe_print("All tests passed.")
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            sys.exit(3)
 
 
 if __name__ == "__main__":

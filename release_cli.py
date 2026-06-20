@@ -3317,6 +3317,19 @@ def _cmd_bulk_resume(args, rules, state):
 
 
 def main():
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(errors="replace")
+            except Exception:
+                pass
+        if hasattr(sys.stderr, "reconfigure"):
+            try:
+                sys.stderr.reconfigure(errors="replace")
+            except Exception:
+                pass
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(
         prog="release_cli",
         description="Release Notes Consistency Check CLI",
