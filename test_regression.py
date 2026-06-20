@@ -4242,6 +4242,370 @@ cli_main()
     cleanup_patterns(tmpdir, "state_t57_b.json")
 
 
+def _read_profiles(tmpdir, state_filename):
+    pp = os.path.join(tmpdir, ".rules_profiles.json")
+    if os.path.exists(pp):
+        with open(pp, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"default_profile_id": None, "profiles": {}, "switch_history": []}
+
+
+def test_58_profile_basic_crud(tmpdir):
+    print("\n== Test 58: Profile basic save/list/switch/diff/rollback/delete ==")
+    sp = os.path.join(tmpdir, "state_t58.json")
+    cleanup_patterns(tmpdir, "state_t58.json")
+
+    print("\n  [Phase 1 - import and save baseline profile]")
+    run_cli(["import", SAMPLE], sp)
+    res_save = run_cli(["profile_save", "--name", "baseline-t58",
+                        "--description", "baseline release rules",
+                        "--tags", "v2.1,baseline",
+                        "--as-default", "--set-active"], sp)
+    assert_in("PROFILE SAVED", res_save.stdout, "t58: save 成功提示")
+    assert_in("baseline-t58", res_save.stdout, "t58: save 输出 profile 名称")
+
+    s = read_state(sp)
+    assert_eq(s.get("active_profile_name"), "baseline-t58", "t58: state 中 active_profile_name 被设置")
+    assert s.get("active_profile_id") is not None, "t58: state 中 active_profile_id 存在"
+
+    pd = _read_profiles(tmpdir, "state_t58.json")
+    baseline_pid = pd["default_profile_id"]
+    assert baseline_pid is not None, "t58: default_profile_id 被持久化"
+    assert baseline_pid in pd["profiles"], "t58: profile 被存储"
+    assert pd["profiles"][baseline_pid]["name"] == "baseline-t58", "t58: 存储的 profile 名称正确"
+
+    print("\n  [Phase 2 - profile_list 显示信息]")
+    res_list = run_cli(["profile_list"], sp)
+    assert_in("baseline-t58", res_list.stdout, "t58: list 显示 profile 名称")
+    assert_in("DEFAULT", res_list.stdout, "t58: list 显示 DEFAULT 标签")
+    assert_in("ACTIVE", res_list.stdout, "t58: list 显示 ACTIVE 标签")
+
+    print("\n  [Phase 3 - profile_detail 查看详情]")
+    res_detail = run_cli(["profile_detail", "--profile", "baseline-t58"], sp)
+    assert_in("baseline-t58", res_detail.stdout, "t58: detail 显示名称")
+    assert_in("baseline release rules", res_detail.stdout, "t58: detail 显示描述")
+
+    print("\n  [Phase 4 - 创建 stricter profile 并 diff]")
+    stricter = os.path.join(tmpdir, "rules_stricter_t58.yaml")
+    _make_rules_stricter(stricter)
+    import yaml
+    with open(RULES, "r", encoding="utf-8") as f:
+        orig_rules_text = f.read()
+    with open(stricter, "r", encoding="utf-8") as f:
+        strict_text = f.read()
+    with open(RULES, "w", encoding="utf-8") as f:
+        f.write(strict_text)
+    try:
+        res_save2 = run_cli(["profile_save", "--name", "stricter-t58",
+                             "--description", "stricter release rules"], sp)
+        assert_in("PROFILE SAVED", res_save2.stdout, "t58: 第二个 profile 保存成功")
+    finally:
+        with open(RULES, "w", encoding="utf-8") as f:
+            f.write(orig_rules_text)
+
+    res_diff = run_cli(["profile_diff", "baseline-t58", "stricter-t58"], sp)
+    assert_in("PROFILE DIFF", res_diff.stdout, "t58: diff 输出标题")
+
+    print("\n  [Phase 5 - switch 到 stricter-t58，再 rollback]")
+    res_switch = run_cli(["profile_switch", "stricter-t58", "--make-default"], sp)
+    assert_in("PROFILE SWITCHED", res_switch.stdout, "t58: switch 成功提示")
+
+    s2 = read_state(sp)
+    assert_eq(s2.get("active_profile_name"), "stricter-t58", "t58: 切换后新 profile 激活")
+    switch_hist = s2.get("profile_switch_history", [])
+    assert len(switch_hist) >= 2, "t58: profile_switch_history 至少有2条"
+
+    res_rb = run_cli(["profile_rollback"], sp)
+    assert_in("PROFILE ROLLBACK", res_rb.stdout, "t58: rollback 提示")
+    s3 = read_state(sp)
+    assert_eq(s3.get("active_profile_name"), "baseline-t58", "t58: rollback 回到 baseline")
+
+    print("\n  [Phase 6 - delete (revoke) stricter-t58，受保护检测]")
+    run_cli(["profile_switch", "stricter-t58"], sp)
+    res_del_fail = run_cli(["profile_delete", "stricter-t58"], sp, expect_fail=True)
+    assert res_del_fail.returncode != 0, "t58: 删除 ACTIVE profile 默认被阻止"
+    run_cli(["profile_switch", "baseline-t58"], sp)
+    res_del_ok = run_cli(["profile_delete", "stricter-t58", "--force"], sp)
+    assert_in("revoked", res_del_ok.stdout, "t58: --force 下 profile 被 revoke")
+
+    pd2 = _read_profiles(tmpdir, "state_t58.json")
+    for pid, p in pd2["profiles"].items():
+        if p.get("name") == "stricter-t58":
+            assert p.get("revoked") is True, "t58: stricter 被标记 revoked"
+            break
+
+    print("\n  [OK] ====== TEST 58 Profile CRUD 全部通过 ======")
+    cleanup_patterns(tmpdir, "state_t58.json")
+    pp = os.path.join(tmpdir, ".rules_profiles.json")
+    if os.path.exists(pp):
+        try:
+            os.remove(pp)
+        except OSError:
+            pass
+
+
+def test_59_profile_export_import_integration(tmpdir):
+    print("\n== Test 59: Profile export/import package integration ==")
+    sp_a = os.path.join(tmpdir, "state_t59_a.json")
+    sp_b = os.path.join(tmpdir, "state_t59_b.json")
+    cleanup_patterns(tmpdir, "state_t59_a.json")
+    cleanup_patterns(tmpdir, "state_t59_b.json")
+
+    print("\n  [Phase 1 - Side A: import, save profile, set active]")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli(["profile_save", "--name", "profile-A-t59",
+             "--description", "side A baseline",
+             "--as-default", "--set-active"], sp_a)
+
+    s_a = read_state(sp_a)
+    pid_a = s_a.get("active_profile_id")
+    assert pid_a is not None, "t59: A side active_profile_id 存在"
+
+    print("\n  [Phase 2 - Side A: export_package 携带 profile_info]")
+    pkg_path = os.path.join(tmpdir, "t59_handoff.json")
+    res_exp = run_cli(["export_package", "-o", pkg_path], sp_a)
+    assert_in("Profile:", res_exp.stdout, "t59: export 输出 Profile 信息")
+    assert_in("profile-A-t59", res_exp.stdout, "t59: export 输出 profile 名称")
+
+    with open(pkg_path, "r", encoding="utf-8") as f:
+        pkg = json.load(f)
+    pinfo = pkg.get("profile_info")
+    assert pinfo is not None, "t59: 包中 profile_info 存在"
+    assert_eq(pinfo.get("profile_name"), "profile-A-t59", "t59: 包中 profile 名称正确")
+    assert_eq(pkg["metadata"].get("active_profile_name"), "profile-A-t59", "t59: metadata 中 profile_name")
+
+    print("\n  [Phase 3 - Side B: 本地注册不同 profile-B，import_package 检测冲突]")
+    stricter = os.path.join(tmpdir, "rules_stricter_t59.yaml")
+    _make_rules_stricter(stricter)
+    with open(RULES, "r", encoding="utf-8") as f:
+        orig_rules_text = f.read()
+    with open(stricter, "r", encoding="utf-8") as f:
+        strict_text = f.read()
+    with open(RULES, "w", encoding="utf-8") as f:
+        f.write(strict_text)
+    try:
+        run_cli(["profile_save", "--name", "profile-B-t59",
+                 "--description", "side B stricter",
+                 "--as-default", "--set-active"], sp_b)
+    finally:
+        with open(RULES, "w", encoding="utf-8") as f:
+            f.write(orig_rules_text)
+
+    res_imp = run_cli(["import_package", pkg_path, "--mode", "takeover"], sp_b)
+    assert_in("profile_mismatch", res_imp.stdout, "t59: 检测到 profile_mismatch 冲突")
+    assert_in("[PROFILE]", res_imp.stdout, "t59: 冲突带 [PROFILE] 标签")
+
+    s_b = read_state(sp_b)
+    pending = s_b.get("pending_takeover")
+    assert pending is not None, "t59: B side pending_takeover 存在"
+    assert pending.get("package_profile_info") is not None, "t59: pending 中保存了包的 profile_info"
+    assert pending.get("active_profile_name_at_import") == "profile-B-t59", "t59: pending 记录了导入时本地 profile 名称"
+
+    print("\n  [Phase 4 - takeover_confirm 后状态中 profile 保留]")
+    run_cli(["takeover_confirm"], sp_b)
+    s_b2 = read_state(sp_b)
+    assert_eq(s_b2.get("active_profile_name"), "profile-A-t59", "t59: takeover 后 A 侧的 profile 被带过来")
+    assert_eq(s_b2.get("active_profile_id"), pid_a, "t59: takeover 后 profile_id 一致")
+
+    print("\n  [Phase 5 - draft + export，Markdown 含 Profile Trace]")
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp_b)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=critical"], sp_b)
+    run_cli(["draft"], sp_b)
+    for sec in ("overview", "changes", "migration", "known_issues"):
+        run_cli(["confirm", sec], sp_b)
+    run_cli(["draft"], sp_b)
+    run_cli(["approve"], sp_b)
+    md_path = os.path.join(tmpdir, "t59_export.md")
+    run_cli(["export", "-o", md_path], sp_b)
+    md = read_file(md_path)
+    assert_in("Rules Profile Trace", md, "t59: Markdown 包含 Rules Profile Trace")
+    assert_in("profile-A-t59", md, "t59: Markdown 包含 profile 名称")
+    assert_in("Last Profile Switch", md, "t59: Markdown 包含 Last Profile Switch")
+
+    print("\n  [Phase 6 - status 显示 profile 信息]")
+    res_st = run_cli(["status"], sp_b)
+    assert_in("Rules Profiles", res_st.stdout, "t59: status 含 Rules Profiles 段")
+    assert_in("Active profile:", res_st.stdout, "t59: status 含 Active profile")
+    assert_in("Default profile:", res_st.stdout, "t59: status 含 Default profile")
+
+    print("\n  [Phase 7 - audit_view 含 profile 切换事件]")
+    res_audit = run_cli(["audit_view"], sp_b)
+    assert_in("[PROFILE]", res_audit.stdout, "t59: audit_view 含 [PROFILE] 标签")
+
+    print("\n  [OK] ====== TEST 59 Profile 导包/导包集成全部通过 ======")
+    cleanup_patterns(tmpdir, "state_t59_a.json")
+    cleanup_patterns(tmpdir, "state_t59_b.json")
+    for fn in os.listdir(tmpdir):
+        full = os.path.join(tmpdir, fn)
+        if fn.startswith(".rules_profiles") or fn.startswith("t59_") or fn.startswith("release_"):
+            try:
+                os.remove(full)
+            except OSError:
+                pass
+
+
+def test_60_profile_rules_upgrade_integration(tmpdir):
+    print("\n== Test 60: Profile rules_upgrade_check/apply integration ==")
+    sp = os.path.join(tmpdir, "state_t60.json")
+    cleanup_patterns(tmpdir, "state_t60.json")
+
+    print("\n  [Phase 1 - 初始宽松规则下 save baseline profile, import, 故意引入 high risk 项]")
+    with open(RULES, "r", encoding="utf-8") as f:
+        orig_rules_text = f.read()
+
+    run_cli(["profile_save", "--name", "loose-t60",
+             "--description", "loose initial rules",
+             "--as-default", "--set-active"], sp)
+    run_cli(["import", SAMPLE], sp)
+    _amend_bad_items(sp)
+
+    print("\n  [Phase 2 - 保存 stricter profile（使用 stricter rules 文件）]")
+    stricter = os.path.join(tmpdir, "rules_stricter_t60.yaml")
+    _make_rules_stricter(stricter)
+    with open(stricter, "r", encoding="utf-8") as f:
+        strict_text = f.read()
+    with open(RULES, "w", encoding="utf-8") as f:
+        f.write(strict_text)
+    try:
+        res_save2 = run_cli(["profile_save", "--name", "strict-t60",
+                             "--description", "strict release rules"], sp)
+        assert_in("PROFILE SAVED", res_save2.stdout, "t60: strict profile 保存成功")
+    finally:
+        with open(RULES, "w", encoding="utf-8") as f:
+            f.write(orig_rules_text)
+
+    print("\n  [Phase 3 - rules_upgrade_check --profile strict-t60 评估影响]")
+    res_check = run_cli_with_rules(["rules_upgrade_check", "--profile", "strict-t60"], sp, RULES)
+    assert_in("Target profile:", res_check.stdout, "t60: rules_upgrade_check 显示 target profile")
+    assert_in("strict-t60", res_check.stdout, "t60: 显示 strict 名称")
+    s = read_state(sp)
+    pending = s.get("pending_rules_upgrade")
+    assert pending is not None, "t60: pending_rules_upgrade 被创建"
+    assert_eq(pending.get("target_profile_name"), "strict-t60", "t60: pending 中 target_profile_name 正确")
+
+    print("\n  [Phase 4 - rules_upgrade_apply --profile 直接应用 profile 到 state]")
+    run_cli_with_rules(["profile_switch", "loose-t60"], sp, RULES)
+    res_apply_profile = run_cli_with_rules(
+        ["rules_upgrade_apply", "--profile", "strict-t60"], sp, RULES
+    )
+    assert_in("Profile applied", res_apply_profile.stdout, "t60: rules_upgrade_apply --profile 成功应用")
+    s2 = read_state(sp)
+    assert_eq(s2.get("active_profile_name"), "strict-t60", "t60: apply 后 active profile 为 strict")
+
+    print("\n  [OK] ====== TEST 60 Profile + rules_upgrade 集成通过 ======")
+    cleanup_patterns(tmpdir, "state_t60.json")
+    pp = os.path.join(tmpdir, ".rules_profiles.json")
+    if os.path.exists(pp):
+        try:
+            os.remove(pp)
+        except OSError:
+            pass
+
+
+def test_61_profile_restart_recovery_and_rollback_continue(tmpdir):
+    print("\n== Test 61: Profile restart-safe default, rollback then continue export ==")
+    sp = os.path.join(tmpdir, "state_t61.json")
+    cleanup_patterns(tmpdir, "state_t61.json")
+
+    print("\n  [Phase 1 - 保存 default profile, import, 激活]")
+    run_cli(["profile_save", "--name", "golden-t61",
+             "--description", "golden restart-safe profile",
+             "--as-default", "--set-active"], sp)
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["draft"], sp)
+
+    s = read_state(sp)
+    golden_id = s.get("active_profile_id")
+    assert golden_id is not None, "t61: golden profile id 存在"
+
+    pd_before = _read_profiles(tmpdir, "state_t61.json")
+    assert_eq(pd_before["default_profile_id"], golden_id, "t61: default_profile_id 持久化成功")
+
+    print("\n  [Phase 2 - 模拟重启：清空 active_profile_id 再运行 status，应自动恢复]")
+    s["active_profile_id"] = None
+    s["active_profile_name"] = None
+    s["last_profile_switch_at"] = None
+    s["last_profile_switch_by"] = None
+    with open(sp, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+
+    res_st_after = run_cli(["status"], sp)
+    assert_in("Restart recovery:", res_st_after.stdout, "t61: status 触发重启恢复")
+    assert_in("golden-t61", res_st_after.stdout, "t61: 恢复后 golden profile 在输出中")
+
+    s2 = read_state(sp)
+    assert_eq(s2.get("active_profile_id"), golden_id, "t61: active_profile_id 恢复")
+    assert_eq(s2.get("active_profile_name"), "golden-t61", "t61: active_profile_name 恢复")
+
+    switch_hist_after = s2.get("profile_switch_history", [])
+    assert len(switch_hist_after) >= 1, "t61: profile_switch_history 至少1条"
+    last_switch = switch_hist_after[-1]
+    assert_eq(last_switch.get("action"), "startup_default_profile", "t61: 最后一条为 startup recovery")
+
+    pd_after = _read_profiles(tmpdir, "state_t61.json")
+    assert len(pd_after.get("switch_history", [])) >= 1, "t61: 全局 switch_history 至少1条"
+    last_global = pd_after["switch_history"][-1]
+    assert last_global.get("restart_activated") is True, "t61: 全局 restart_activated=True"
+
+    print("\n  [Phase 3 - 切换到 alternate profile，再 profile_rollback 回 golden]")
+    stricter = os.path.join(tmpdir, "rules_stricter_t61.yaml")
+    _make_rules_stricter(stricter)
+    with open(RULES, "r", encoding="utf-8") as f:
+        orig_rules = f.read()
+    with open(stricter, "r", encoding="utf-8") as f:
+        strict_rules = f.read()
+    with open(RULES, "w", encoding="utf-8") as f:
+        f.write(strict_rules)
+    try:
+        run_cli(["profile_save", "--name", "alternate-t61",
+                 "--description", "alternate rules"], sp)
+    finally:
+        with open(RULES, "w", encoding="utf-8") as f:
+            f.write(orig_rules)
+
+    run_cli(["profile_switch", "alternate-t61"], sp)
+    s3 = read_state(sp)
+    assert_eq(s3.get("active_profile_name"), "alternate-t61", "t61: 切换成功到 alternate")
+
+    run_cli(["profile_rollback"], sp)
+    s4 = read_state(sp)
+    assert_eq(s4.get("active_profile_name"), "golden-t61", "t61: rollback 回到 golden")
+
+    print("\n  [Phase 4 - 回滚后继续 draft、confirm、approve、export]")
+    run_cli(["amend", "CHG-003", "--field", "owner=周七"], sp)
+    run_cli(["amend", "CHG-003", "--field", "risk_level=high"], sp)
+    run_cli(["amend", "CHG-005", "--field", "risk_level=high"], sp)
+    run_cli(["draft"], sp)
+    for sec in ["overview", "changes", "migration", "known_issues"]:
+        run_cli(["confirm", sec], sp)
+    run_cli(["draft"], sp)
+    run_cli(["approve"], sp)
+    md_path = os.path.join(tmpdir, "t61_final.md")
+    run_cli(["export", "-o", md_path], sp)
+
+    md = read_file(md_path)
+    assert_in("Rules Profile Trace", md, "t61: 最终 Markdown 包含 Profile Trace")
+    assert_in("golden-t61", md, "t61: Markdown 包含 golden profile 名")
+    assert_in("Recent Switch History", md, "t61: Markdown 包含 Recent Switch History")
+    assert_in("startup_default_profile", md, "t61: Markdown 中看到 startup recovery 切换")
+    assert_in("profile_rollback", md, "t61: Markdown 中看到 profile_rollback 切换")
+
+    print("\n  [Phase 5 - status 含完整 profile 信息]")
+    res_st_final = run_cli(["status"], sp)
+    assert_in("Switch history:", res_st_final.stdout, "t61: status 含 switch history 计数")
+    assert_in("[AUTO-ON-RESTART]", res_st_final.stdout, "t61: status 中 switch 带 [AUTO-ON-RESTART] 标记")
+
+    print("\n  [OK] ====== TEST 61 Profile 重启恢复 + 回滚 + 继续导出完整通过 ======")
+    cleanup_patterns(tmpdir, "state_t61.json")
+    for fn in os.listdir(tmpdir):
+        full = os.path.join(tmpdir, fn)
+        if fn.startswith(".rules_profiles") or fn.startswith("t61_") or fn.startswith("release_"):
+            try:
+                os.remove(full)
+            except OSError:
+                pass
+
+
 def main():
     global PASS, FAIL
     try:
@@ -4319,6 +4683,10 @@ def main():
         test_55_rules_upgrade_handover_confirm_and_revoke(tmpdir)
         test_56_rules_upgrade_handover_cross_restart(tmpdir)
         test_57_full_e2e_rules_upgrade_handover_workflow(tmpdir)
+        test_58_profile_basic_crud(tmpdir)
+        test_59_profile_export_import_integration(tmpdir)
+        test_60_profile_rules_upgrade_integration(tmpdir)
+        test_61_profile_restart_recovery_and_rollback_continue(tmpdir)
     except Exception as e:
         fatal_exception = e
         safe_print(f"\n*** FATAL EXCEPTION during tests: {type(e).__name__}: {e} ***")

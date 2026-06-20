@@ -16,6 +16,7 @@ DEFAULT_RULES = os.path.join(SCRIPT_DIR, "rules.yaml")
 DEFAULT_STATE = os.path.join(SCRIPT_DIR, ".release_state.json")
 
 PACKAGE_FORMAT_VERSION = "1.0.0"
+DEFAULT_PROFILES = os.path.join(SCRIPT_DIR, ".rules_profiles.json")
 
 try:
     import yaml
@@ -94,6 +95,12 @@ def _new_state(version, batch_id):
         "rules_upgrade_handover_history": [],
         "imported_rules_upgrade_packages": [],
         "pending_rules_upgrade_import": None,
+        "active_profile_id": None,
+        "active_profile_name": None,
+        "profile_overrides": {},
+        "profile_switch_history": [],
+        "last_profile_switch_at": None,
+        "last_profile_switch_by": None,
     }
 
 
@@ -316,6 +323,26 @@ def _build_package(state, operator, rules_path, description):
 
     handover_summary = _build_handover_summary(state)
 
+    profile_info = None
+    if state.get("active_profile_id") or state.get("active_profile_name"):
+        overrides = state.get("profile_overrides", {})
+        override_summary = {}
+        for k, v in overrides.items():
+            if isinstance(v, dict) and "added" in v and "removed" in v:
+                override_summary[k] = {
+                    "added_count": len(v.get("added", [])),
+                    "removed_count": len(v.get("removed", [])),
+                }
+        profile_info = {
+            "profile_id": state.get("active_profile_id"),
+            "profile_name": state.get("active_profile_name"),
+            "profile_overrides": overrides,
+            "profile_overrides_summary": override_summary,
+            "last_profile_switch_at": state.get("last_profile_switch_at"),
+            "last_profile_switch_by": state.get("last_profile_switch_by"),
+            "profile_switch_history_count": len(state.get("profile_switch_history", [])),
+        }
+
     package = {
         "package_format_version": PACKAGE_FORMAT_VERSION,
         "exported_at": datetime.now().isoformat(),
@@ -325,6 +352,7 @@ def _build_package(state, operator, rules_path, description):
         "state_checksum": _compute_state_checksum(state),
         "rules_snapshot": rules_copy,
         "handover_summary": handover_summary,
+        "profile_info": profile_info,
         "metadata": {
             "version": state.get("version"),
             "draft_version": state.get("draft_version"),
@@ -339,6 +367,9 @@ def _build_package(state, operator, rules_path, description):
             "rules_upgrade_history_count": len(state.get("rules_upgrade_history", [])),
             "rules_upgrade_revoked_count": len([r for r in state.get("rules_upgrade_history", []) if r.get("revoked")]),
             "has_pending_rules_upgrade": state.get("pending_rules_upgrade") is not None,
+            "active_profile_id": state.get("active_profile_id"),
+            "active_profile_name": state.get("active_profile_name"),
+            "has_profile_overrides": bool(state.get("profile_overrides")),
         }
     }
     return package
@@ -682,6 +713,955 @@ def _ensure_rules_snapshot(state, rules_path):
         rules = load_rules(rules_path)
         state["rules_snapshot"] = copy.deepcopy(rules)
         state["rules_version"] = _compute_rules_checksum(rules)
+
+
+def _get_profiles_path(state_path):
+    return os.path.join(os.path.dirname(os.path.abspath(state_path)), ".rules_profiles.json")
+
+
+def load_profiles(state_path):
+    profiles_path = _get_profiles_path(state_path)
+    if not os.path.exists(profiles_path):
+        return {
+            "default_profile_id": None,
+            "profiles": {},
+            "switch_history": [],
+        }
+    with open(profiles_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("default_profile_id", None)
+    data.setdefault("profiles", {})
+    data.setdefault("switch_history", [])
+    return data
+
+
+def save_profiles(profiles_data, state_path):
+    profiles_path = _get_profiles_path(state_path)
+    with open(profiles_path, "w", encoding="utf-8") as f:
+        json.dump(profiles_data, f, ensure_ascii=False, indent=2)
+
+
+def _compute_profile_checksum(rules_obj, rules_text=None):
+    if rules_text is not None:
+        return hashlib.sha256(rules_text.encode("utf-8")).hexdigest()
+    serialized = json.dumps(rules_obj, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _get_rules_text(rules_path):
+    if rules_path and os.path.exists(rules_path):
+        with open(rules_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return None
+
+
+def _ensure_state_profile_fields(state):
+    state.setdefault("active_profile_id", None)
+    state.setdefault("active_profile_name", None)
+    state.setdefault("profile_overrides", {})
+    state.setdefault("profile_switch_history", [])
+    state.setdefault("last_profile_switch_at", None)
+    state.setdefault("last_profile_switch_by", None)
+
+
+def _get_active_profile_from_state_or_default(state, state_path):
+    active_id = state.get("active_profile_id") if state else None
+    if active_id:
+        return active_id
+    profiles_data = load_profiles(state_path)
+    return profiles_data.get("default_profile_id")
+
+
+def _resolve_profile_identifier(state_path, identifier, include_revoked=False):
+    profiles_data = load_profiles(state_path)
+    profiles = profiles_data["profiles"]
+    if identifier in profiles:
+        if not include_revoked and profiles[identifier].get("revoked"):
+            return None, profiles_data, "revoked"
+        return identifier, profiles_data, None
+    for pid, p in profiles.items():
+        if p.get("name") == identifier and (include_revoked or not p.get("revoked")):
+            return pid, profiles_data, None
+    for pid, p in profiles.items():
+        if p.get("name") == identifier:
+            return pid, profiles_data, "revoked" if p.get("revoked") else None
+    return None, profiles_data, "not_found"
+
+
+def _detect_profile_conflicts(package, profiles_data, active_profile_id, active_profile):
+    conflicts = []
+    pinfo = package.get("profile_info")
+    pkg_profile_id = pinfo.get("profile_id") if pinfo else None
+    pkg_profile_name = pinfo.get("profile_name") if pinfo else None
+
+    if not pinfo:
+        if active_profile_id:
+            conflicts.append({
+                "severity": "medium",
+                "type": "profile_missing_in_package",
+                "message": f"Package has no profile info but local active profile '{active_profile.get('name') or active_profile_id[:12]}' is set. Rules may diverge.",
+                "resolution_options": [
+                    "Verify package was exported with profile_save first",
+                    "Run profile_diff to compare local rules vs package rules snapshot",
+                ],
+            })
+        return conflicts
+
+    if not active_profile_id and pkg_profile_id:
+        conflicts.append({
+            "severity": "low",
+            "type": "profile_inactive_local",
+            "message": f"Package used profile '{pkg_profile_name or pkg_profile_id[:12]}' but local has no active profile. Drift likely.",
+            "resolution_options": [
+                f"Run profile_switch {pkg_profile_name or pkg_profile_id[:12]} to align",
+                "Use --profile flag during import_package",
+            ],
+        })
+        return conflicts
+
+    if pkg_profile_id and active_profile_id and pkg_profile_id != active_profile_id:
+        pkg_override_sum = (pinfo.get("profile_overrides_summary") or {})
+        override_parts = []
+        for k, s in pkg_override_sum.items():
+            override_parts.append(f"{k}:+{s.get('added_count',0)}/-{s.get('removed_count',0)}")
+        override_desc = f" (pkg overrides: {', '.join(override_parts)})" if override_parts else ""
+        conflicts.append({
+            "severity": "high",
+            "type": "profile_mismatch",
+            "message": f"Package profile '{pkg_profile_name or pkg_profile_id[:12]}' differs from local active '{active_profile.get('name') or active_profile_id[:12]}'{override_desc}. Rules baseline not aligned.",
+            "resolution_options": [
+                f"Run profile_switch {pkg_profile_name or pkg_profile_id[:12]} to switch to package's profile",
+                f"Use --profile {pkg_profile_name or pkg_profile_id[:12]} during import_package",
+                "Run profile_diff to inspect exact differences",
+            ],
+        })
+        return conflicts
+
+    if pkg_profile_id and active_profile_id and pkg_profile_id == active_profile_id:
+        pkg_overrides = pinfo.get("profile_overrides") or {}
+        if pkg_overrides:
+            parts = []
+            for k, v in pkg_overrides.items():
+                if isinstance(v, dict):
+                    add_cnt = len(v.get("added_by_state", []))
+                    rem_cnt = len(v.get("removed_by_state", []))
+                    if add_cnt or rem_cnt:
+                        parts.append(f"{k}: state +{add_cnt}/-{rem_cnt} vs profile")
+            if parts:
+                conflicts.append({
+                    "severity": "medium",
+                    "type": "profile_overrides_in_package",
+                    "message": f"Package state overrides profile baseline: {'; '.join(parts)}",
+                    "resolution_options": [
+                        "Inspect override details via takeover_detail",
+                        "Consider re-exporting package after aligning state to profile",
+                    ],
+                })
+    return conflicts
+
+
+def cmd_profile_save(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    name = args.name
+    description = args.description or ""
+    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    operator = getattr(args, "operator", None) or _get_identity()
+    as_default = getattr(args, "as_default", False)
+    set_active = getattr(args, "set_active", False)
+
+    if not name:
+        print("[ERROR] --name is required to save a profile.")
+        sys.exit(1)
+
+    profiles_data = load_profiles(state_path)
+    rules_text = _get_rules_text(args.rules)
+    rules_snapshot = copy.deepcopy(rules)
+    rules_checksum = _compute_profile_checksum(rules_snapshot, rules_text)
+    rules_version = _compute_rules_checksum(rules_snapshot)
+
+    profile_id = hashlib.sha256(
+        f"{name}{datetime.now().isoformat()}{rules_checksum}".encode()
+    ).hexdigest()[:12]
+
+    existing_same_name = [
+        pid for pid, p in profiles_data["profiles"].items()
+        if p.get("name") == name
+    ]
+    if existing_same_name and not args.force:
+        print(f"[BLOCKED] Profile named '{name}' already exists (id={existing_same_name[0]}).")
+        print("  Use --force to overwrite (creates new version with same name, old one kept).")
+        sys.exit(1)
+
+    profile = {
+        "profile_id": profile_id,
+        "name": name,
+        "description": description,
+        "tags": tags,
+        "created_at": datetime.now().isoformat(),
+        "created_by": operator,
+        "rules_text": rules_text,
+        "rules_snapshot": rules_snapshot,
+        "rules_checksum": rules_checksum,
+        "rules_version": rules_version,
+        "state_rules_version_at_save": state.get("rules_version") if state else None,
+        "state_version_at_save": state.get("version") if state else None,
+        "state_draft_version_at_save": state.get("draft_version", 0) if state else 0,
+        "revoked": False,
+        "revoked_at": None,
+        "revoked_by": None,
+        "revoke_reason": None,
+    }
+
+    profiles_data["profiles"][profile_id] = profile
+
+    if as_default or (profiles_data["default_profile_id"] is None):
+        profiles_data["default_profile_id"] = profile_id
+
+    save_profiles(profiles_data, state_path)
+
+    if state is None:
+        state = _new_state(
+            profile.get("state_version_at_save") or "UNKNOWN",
+            "profile-init-batch"
+        )
+
+    _ensure_state_profile_fields(state)
+
+    if set_active:
+        _apply_profile_to_state_and_rules(state, profile, args.rules, operator, "profile_save_set_active")
+
+    if state is not None:
+        save_state(state, state_path)
+
+    print("\n" + "=" * 70)
+    print("PROFILE SAVED")
+    print("=" * 70)
+    print(f"  Profile ID:    {profile_id}")
+    print(f"  Name:          {name}")
+    if description:
+        print(f"  Description:   {description}")
+    if tags:
+        print(f"  Tags:          {', '.join(tags)}")
+    print(f"  Created by:    {operator}")
+    print(f"  Rules checksum:{rules_checksum[:16]}...")
+    print(f"  Rules version: {rules_version[:16]}...")
+    if as_default or profiles_data["default_profile_id"] == profile_id:
+        print(f"  Default:       YES (restart-safe, auto-activated)")
+    if set_active:
+        print(f"  Active now:    YES (applied to local rules.yaml & state)")
+    print()
+    print(f"  Total profiles: {len(profiles_data['profiles'])}")
+    print("=" * 70)
+    print()
+
+
+def cmd_profile_list(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    profiles_data = load_profiles(state_path)
+    profiles = profiles_data["profiles"]
+    default_id = profiles_data["default_profile_id"]
+
+    if not profiles:
+        print("[INFO] No profiles saved yet.")
+        print("  Run 'profile_save --name <name>' to create your first profile.")
+        return
+
+    active_id = _get_active_profile_from_state_or_default(state, state_path)
+    current_rules_text = _get_rules_text(args.rules)
+    current_checksum = _compute_profile_checksum(rules, current_rules_text) if current_rules_text is not None else _compute_profile_checksum(rules)
+
+    print("\n" + "=" * 70)
+    print("RULES PROFILES")
+    print("=" * 70)
+    print(f"  Total:        {len(profiles)}")
+    if default_id:
+        default_p = profiles.get(default_id, {})
+        print(f"  Default:      {default_id} ({default_p.get('name', '?')})")
+    if active_id:
+        active_p = profiles.get(active_id, {})
+        print(f"  Active:       {active_id} ({active_p.get('name', '?')})")
+    print()
+
+    for idx, (pid, p) in enumerate(sorted(profiles.items(), key=lambda x: x[1].get("created_at", "")), 1):
+        tags = ""
+        if p.get("tags"):
+            tags = f" [tags: {', '.join(p['tags'])}]"
+        match_flag = ""
+        if p.get("rules_checksum") == current_checksum:
+            match_flag = " [MATCHES local rules.yaml]"
+        revoked_flag = " [REVOKED]" if p.get("revoked") else ""
+        default_flag = " [DEFAULT]" if pid == default_id else ""
+        active_flag = " [ACTIVE]" if pid == active_id else ""
+        print(f"{idx:>3}. {p.get('name', '(unnamed)')}{tags}{match_flag}{default_flag}{active_flag}{revoked_flag}")
+        print(f"     ID:          {pid}")
+        print(f"     Created:     {p.get('created_at')} by {p.get('created_by')}")
+        if p.get("description"):
+            print(f"     Description: {p['description'][:80]}")
+        print(f"     Checksum:    {p.get('rules_checksum', '')[:16]}...")
+        diff = _compare_rules_configs(p.get("rules_snapshot", {}), rules)
+        changes = []
+        for k in ("required_sections", "valid_risk_levels", "required_fields_per_item", "categories"):
+            d = diff.get(k, {})
+            if d.get("added"):
+                changes.append(f"+{k[:4]}:{len(d['added'])}")
+            if d.get("removed"):
+                changes.append(f"-{k[:4]}:{len(d['removed'])}")
+        if changes:
+            print(f"     vs local:    {' '.join(changes)}")
+        else:
+            print(f"     vs local:    identical")
+        if p.get("revoked"):
+            print(f"     Revoked:     {p.get('revoked_at')} by {p.get('revoked_by')} - {p.get('revoke_reason', '')[:60]}")
+        print()
+
+    switch_hist = profiles_data.get("switch_history", [])
+    if switch_hist:
+        print(f"[Recent Switches: {len(switch_hist)}]")
+        for s in switch_hist[-5:]:
+            tags = []
+            if s.get("became_default"):
+                tags.append("[DEFAULT]")
+            if s.get("restart_activated"):
+                tags.append("[AUTO-ON-RESTART]")
+            tag_str = "".join(tags)
+            print(f"  [{s.get('ts', '')[:19]}] {s.get('from_name', 'N/A')} -> {s.get('to_name', 'N/A')}"
+                  f"{tag_str} by {s.get('operator', '')}")
+            if s.get("diff_summary"):
+                print(f"      diff: {s['diff_summary'][:100]}")
+
+    print("=" * 70)
+    print()
+
+
+def cmd_profile_switch(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    identifier = args.profile
+    operator = getattr(args, "operator", None) or _get_identity()
+    make_default = getattr(args, "make_default", False)
+
+    if not identifier:
+        print("[ERROR] Profile name or ID is required.")
+        print("  Use 'profile_list' to see available profiles.")
+        sys.exit(1)
+
+    profiles_data = load_profiles(state_path)
+    profiles = profiles_data["profiles"]
+
+    target = None
+    target_id = None
+    if identifier in profiles:
+        target_id = identifier
+        target = profiles[identifier]
+    else:
+        for pid, p in profiles.items():
+            if p.get("name") == identifier and not p.get("revoked"):
+                target_id = pid
+                target = p
+                break
+        if target is None:
+            for pid, p in profiles.items():
+                if p.get("name") == identifier:
+                    target_id = pid
+                    target = p
+                    break
+
+    if target is None:
+        print(f"[ERROR] Profile '{identifier}' not found.")
+        print("  Use 'profile_list' to see available profiles.")
+        sys.exit(1)
+
+    if target.get("revoked") and not args.force:
+        print(f"[BLOCKED] Profile '{target.get('name')}' is REVOKED.")
+        print(f"  Revoked at: {target.get('revoked_at')} by {target.get('revoked_by')}")
+        print(f"  Reason: {target.get('revoke_reason', '')}")
+        print("  Use --force to switch anyway.")
+        sys.exit(1)
+
+    if state is None:
+        state = _new_state("UNKNOWN", "profile-switch-batch")
+    _ensure_state_profile_fields(state)
+
+    old_active_id = state.get("active_profile_id")
+    old_active_name = state.get("active_profile_name") or (
+        profiles.get(old_active_id, {}).get("name") if old_active_id in profiles else None
+    )
+
+    diff = _compare_rules_configs(
+        target.get("rules_snapshot", {}),
+        rules
+    )
+    changes_summary_parts = []
+    for k in ("required_sections", "valid_risk_levels", "required_fields_per_item", "categories"):
+        d = diff.get(k, {})
+        if d.get("added"):
+            changes_summary_parts.append(f"{k}: +{len(d['added'])}")
+        if d.get("removed"):
+            changes_summary_parts.append(f"{k}: -{len(d['removed'])}")
+    diff_summary = ", ".join(changes_summary_parts) or "identical"
+
+    conflict_warnings = []
+    if diff.get("has_changes"):
+        if state.get("rules_snapshot"):
+            vs_state = _compare_rules_configs(
+                state.get("rules_snapshot", {}),
+                target.get("rules_snapshot", {})
+            )
+            if vs_state.get("has_changes"):
+                conflict_warnings.append(
+                    "State's embedded rules_snapshot differs from target profile - state may have drifted"
+                )
+        if diff["valid_risk_levels"]["removed"]:
+            conflict_warnings.append(
+                f"Risk levels being removed: {diff['valid_risk_levels']['removed']} - check items"
+            )
+        if diff["categories"]["removed"]:
+            conflict_warnings.append(
+                f"Categories being removed: {diff['categories']['removed']} - check items"
+            )
+        if diff["required_fields_per_item"]["added"]:
+            conflict_warnings.append(
+                f"New required fields: {diff['required_fields_per_item']['added']} - may need amendments"
+            )
+
+    _apply_profile_to_state_and_rules(state, target, args.rules, operator, "profile_switch")
+
+    if make_default or profiles_data.get("default_profile_id") is None:
+        profiles_data["default_profile_id"] = target_id
+
+    profiles_data.setdefault("switch_history", []).append({
+        "ts": datetime.now().isoformat(),
+        "operator": operator,
+        "from_profile_id": old_active_id,
+        "from_name": old_active_name,
+        "to_profile_id": target_id,
+        "to_name": target.get("name"),
+        "diff_summary": diff_summary,
+        "has_conflicts": len(conflict_warnings) > 0,
+        "conflict_warnings": conflict_warnings,
+        "became_default": profiles_data.get("default_profile_id") == target_id,
+        "restart_activated": False,
+    })
+
+    save_profiles(profiles_data, state_path)
+    save_state(state, state_path)
+
+    print("\n" + "=" * 70)
+    print("PROFILE SWITCHED")
+    print("=" * 70)
+    print(f"  From:          {old_active_name or '(none)'} ({old_active_id or 'N/A'})")
+    print(f"  To:            {target.get('name')} ({target_id})")
+    print(f"  Operator:      {operator}")
+    print(f"  rules.yaml:    UPDATED from profile snapshot")
+    print(f"  state link:    UPDATED (active_profile_id set)")
+    print(f"  vs local diff: {diff_summary}")
+    if make_default:
+        print(f"  Default:       SET (will be auto-activated on restart)")
+    print()
+
+    if conflict_warnings:
+        print("[CONFLICT / DRIFT WARNINGS]")
+        for w in conflict_warnings:
+            print(f"  ! {w}")
+        print()
+        print("  Remediation options:")
+        print("    1. Run 'profile_diff <this-profile> current' to inspect exact field differences")
+        print("    2. Run 'rules_upgrade_check' to assess impact on existing items & confirmations")
+        print("    3. Run 'profile_rollback' if this was unintended")
+        print()
+
+    if diff.get("has_changes"):
+        print("  Auto-check: running rules_upgrade_check to surface impact...")
+        cmd_rules_upgrade_check(args, target.get("rules_snapshot") or rules)
+
+    print("=" * 70)
+    print()
+
+
+def _apply_profile_to_state_and_rules(state, profile, rules_path, operator, action_source):
+    profile_id = profile.get("profile_id")
+    profile_name = profile.get("name")
+
+    old_active_id = state.get("active_profile_id")
+    old_active_name = state.get("active_profile_name")
+
+    if profile.get("rules_text") is not None and rules_path:
+        rules_dir = os.path.dirname(rules_path)
+        if not os.path.exists(rules_dir):
+            os.makedirs(rules_dir, exist_ok=True)
+        with open(rules_path, "w", encoding="utf-8") as f:
+            f.write(profile["rules_text"])
+
+    state["active_profile_id"] = profile_id
+    state["active_profile_name"] = profile_name
+    state["last_profile_switch_at"] = datetime.now().isoformat()
+    state["last_profile_switch_by"] = operator
+
+    switch_entry = {
+        "ts": datetime.now().isoformat(),
+        "operator": operator,
+        "action": action_source,
+        "from_profile_id": old_active_id,
+        "from_name": old_active_name,
+        "to_profile_id": profile_id,
+        "to_name": profile_name,
+    }
+    state.setdefault("profile_switch_history", []).append(switch_entry)
+
+    if profile.get("rules_snapshot") is not None:
+        state["rules_snapshot"] = copy.deepcopy(profile["rules_snapshot"])
+        state["rules_version"] = profile.get("rules_version") or _compute_rules_checksum(profile["rules_snapshot"])
+
+    overrides = {}
+    if state.get("rules_snapshot") and profile.get("rules_snapshot"):
+        rs = state["rules_snapshot"]
+        ps = profile["rules_snapshot"]
+        for k in ("required_sections", "valid_risk_levels", "required_fields_per_item", "categories"):
+            rs_set = set(rs.get(k, []))
+            ps_set = set(ps.get(k, []))
+            if rs_set != ps_set:
+                overrides[k] = {
+                    "in_profile": sorted(ps_set),
+                    "in_state": sorted(rs_set),
+                    "added_by_state": sorted(rs_set - ps_set),
+                    "removed_by_state": sorted(ps_set - rs_set),
+                }
+    state["profile_overrides"] = overrides
+
+    _audit(state, "profile_applied",
+           f"source={action_source} profile_id={profile_id} name={profile_name} "
+           f"operator={operator} overrides={len(overrides)}")
+
+
+def cmd_profile_diff(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    profiles_data = load_profiles(state_path)
+    profiles = profiles_data["profiles"]
+    identifier_a = args.profile_a
+    identifier_b = args.profile_b or "current"
+
+    def _resolve(ident):
+        if ident == "current":
+            rules_text = _get_rules_text(args.rules)
+            return {
+                "label": f"current rules.yaml (local)",
+                "snapshot": copy.deepcopy(rules),
+                "text": rules_text,
+            }
+        if ident == "state":
+            snap = (state or {}).get("rules_snapshot")
+            if snap is None:
+                print("[ERROR] State has no embedded rules_snapshot - import or run profile_save first.")
+                sys.exit(1)
+            return {
+                "label": f"state.rules_snapshot (v{(state or {}).get('rules_version', '')[:12]}...)",
+                "snapshot": copy.deepcopy(snap),
+                "text": None,
+            }
+        if ident in profiles:
+            p = profiles[ident]
+            return {
+                "label": f"profile '{p.get('name')}' ({ident})",
+                "snapshot": copy.deepcopy(p.get("rules_snapshot", {})),
+                "text": p.get("rules_text"),
+            }
+        for pid, p in profiles.items():
+            if p.get("name") == ident:
+                return {
+                    "label": f"profile '{p.get('name')}' ({pid})",
+                    "snapshot": copy.deepcopy(p.get("rules_snapshot", {})),
+                    "text": p.get("rules_text"),
+                }
+        print(f"[ERROR] Profile '{ident}' not found.")
+        sys.exit(1)
+
+    a = _resolve(identifier_a)
+    b = _resolve(identifier_b)
+
+    diff = _compare_rules_configs(a["snapshot"], b["snapshot"])
+
+    print("\n" + "=" * 70)
+    print(f"PROFILE DIFF: {a['label']}  ->  {b['label']}")
+    print("=" * 70)
+    print()
+
+    if not diff.get("has_changes"):
+        print("  [IDENTICAL] No configuration differences.")
+        if a.get("text") is not None and b.get("text") is not None:
+            a_lines = a["text"].splitlines()
+            b_lines = b["text"].splitlines()
+            if a_lines != b_lines:
+                only_a = [l for l in a_lines if l.strip() and l not in b_lines]
+                only_b = [l for l in b_lines if l.strip() and l not in a_lines]
+                if only_a or only_b:
+                    print("  Note: whitespace/comment-level differences exist in raw text.")
+                    if only_a:
+                        print(f"  In A not in B: {len(only_a)} line(s)")
+                    if only_b:
+                        print(f"  In B not in A: {len(only_b)} line(s)")
+        print()
+    else:
+        for key, pretty in [
+            ("required_sections", "Required Sections"),
+            ("valid_risk_levels", "Valid Risk Levels"),
+            ("required_fields_per_item", "Required Fields Per Item"),
+            ("categories", "Categories"),
+        ]:
+            d = diff[key]
+            if d.get("added") or d.get("removed"):
+                print(f"  [{pretty}]")
+                if d.get("added"):
+                    for val in d["added"]:
+                        print(f"    + {val}")
+                if d.get("removed"):
+                    for val in d["removed"]:
+                        print(f"    - {val}")
+                print()
+
+        if state and identifier_a != "state" and identifier_b != "state":
+            active_id = state.get("active_profile_id")
+            if active_id:
+                active_p = profiles.get(active_id, {})
+                print(f"  Note: state currently linked to profile '{active_p.get('name', '?')}' ({active_id})")
+                if state.get("profile_overrides"):
+                    print(f"  Note: state has {len(state['profile_overrides'])} local overrides vs linked profile")
+
+    if state and not diff.get("has_changes"):
+        rules_text = _get_rules_text(args.rules)
+        current_checksum = _compute_profile_checksum(rules, rules_text) if rules_text is not None else _compute_profile_checksum(rules)
+        for pid, p in profiles.items():
+            if p.get("rules_checksum") == current_checksum:
+                print(f"  Matching saved profile: '{p.get('name')}' ({pid})")
+                break
+
+    print("=" * 70)
+    print()
+
+
+def cmd_profile_rollback(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    operator = getattr(args, "operator", None) or _get_identity()
+    identifier = getattr(args, "profile", None)
+    reason = getattr(args, "reason", "") or "manual rollback"
+
+    if state is None:
+        print("[ERROR] No state to rollback - no profile switches have occurred.")
+        sys.exit(1)
+
+    _ensure_state_profile_fields(state)
+    switch_history = state.get("profile_switch_history", [])
+
+    target_profile = None
+    target_profile_id = None
+
+    if identifier:
+        profiles_data = load_profiles(state_path)
+        profiles = profiles_data["profiles"]
+        if identifier in profiles:
+            target_profile_id = identifier
+            target_profile = profiles[identifier]
+        else:
+            for pid, p in profiles.items():
+                if p.get("name") == identifier and not p.get("revoked"):
+                    target_profile_id = pid
+                    target_profile = p
+                    break
+        if target_profile is None:
+            print(f"[ERROR] Rollback target profile '{identifier}' not found.")
+            sys.exit(1)
+    else:
+        profiles_data = load_profiles(state_path)
+        profiles = profiles_data["profiles"]
+        prev_id = None
+        prev_name = None
+        if len(switch_history) >= 2:
+            prev_entry = switch_history[-2]
+            prev_id = prev_entry.get("from_profile_id")
+            prev_name = prev_entry.get("from_name")
+            if not prev_id and prev_name:
+                for pid, p in profiles.items():
+                    if p.get("name") == prev_name and not p.get("revoked"):
+                        prev_id = pid
+                        break
+        if not prev_id:
+            active_id = state.get("active_profile_id")
+            candidates = [
+                (pid, p) for pid, p in profiles.items()
+                if not p.get("revoked") and pid != active_id
+            ]
+            if len(candidates) == 1:
+                prev_id = candidates[0][0]
+                prev_name = candidates[0][1].get("name")
+        if not prev_id:
+            print(f"[ERROR] Cannot auto-rollback: prior switch came from '{prev_name or '(none)'}'.")
+            print("  Specify an explicit target with --profile <name-or-id>.")
+            sys.exit(1)
+        target_profile = profiles.get(prev_id)
+        if target_profile is None:
+            print(f"[ERROR] Prior profile {prev_id} no longer exists in profiles store.")
+            sys.exit(1)
+        target_profile_id = prev_id
+        print(f"[INFO] Auto rollback to prior profile: '{target_profile.get('name')}' ({target_profile_id})")
+
+    if state.get("approved") and not args.force:
+        print("[BLOCKED] State is currently APPROVED.")
+        print("  Rolling back rules profile will clear approval status.")
+        print("  Re-run with --force to proceed.")
+        sys.exit(1)
+
+    print("\n" + "=" * 70)
+    print("PROFILE ROLLBACK")
+    print("=" * 70)
+    print(f"  Target profile: {target_profile.get('name')} ({target_profile_id})")
+    print(f"  Current state:  v{state.get('version')} / draft v{state.get('draft_version', 0)}")
+    print(f"  Approved:       {state.get('approved', False)}")
+    print()
+
+    _apply_profile_to_state_and_rules(state, target_profile, args.rules, operator, "profile_rollback")
+
+    profiles_data = load_profiles(state_path)
+    profiles_data.setdefault("switch_history", []).append({
+        "ts": datetime.now().isoformat(),
+        "operator": operator,
+        "from_profile_id": switch_history[-1].get("to_profile_id") if switch_history else None,
+        "from_name": switch_history[-1].get("to_name") if switch_history else None,
+        "to_profile_id": target_profile_id,
+        "to_name": target_profile.get("name"),
+        "diff_summary": "rollback",
+        "has_conflicts": False,
+        "conflict_warnings": [],
+        "became_default": False,
+        "restart_activated": False,
+        "rollback_reason": reason,
+    })
+    save_profiles(profiles_data, state_path)
+
+    if state.get("approved"):
+        state["approved"] = False
+        state["approved_at_version"] = None
+        state["approved_at_draft_version"] = None
+        print("  [NOTE] Approval cleared (rules changed by rollback).")
+
+    _audit(state, "profile_rollback",
+           f"to_profile_id={target_profile_id} name={target_profile.get('name')} "
+           f"operator={operator} reason={reason}")
+
+    save_state(state, state_path)
+
+    print(f"  Rollback complete. rules.yaml restored, state re-linked.")
+    print(f"  Suggested next: status, rules_upgrade_check (if drift detected)")
+    print("=" * 70)
+    print()
+
+
+def cmd_profile_delete(args, rules):
+    state_path = args.state
+    identifier = args.profile
+    operator = getattr(args, "operator", None) or _get_identity()
+    reason = getattr(args, "reason", "") or "manual deletion"
+
+    if not identifier:
+        print("[ERROR] Profile name or ID is required.")
+        sys.exit(1)
+
+    profiles_data = load_profiles(state_path)
+    profiles = profiles_data["profiles"]
+
+    target_id = None
+    target = None
+    if identifier in profiles:
+        target_id = identifier
+        target = profiles[identifier]
+    else:
+        for pid, p in profiles.items():
+            if p.get("name") == identifier:
+                target_id = pid
+                target = p
+                break
+
+    if target is None:
+        print(f"[ERROR] Profile '{identifier}' not found.")
+        sys.exit(1)
+
+    state = load_state(state_path)
+    if state and state.get("active_profile_id") == target_id and not args.force:
+        print(f"[BLOCKED] Profile '{target.get('name')}' is currently ACTIVE in state.")
+        print("  Switch to another profile first, or use --force.")
+        sys.exit(1)
+
+    if profiles_data.get("default_profile_id") == target_id and not args.force:
+        print(f"[BLOCKED] Profile '{target.get('name')}' is the DEFAULT (restart auto-activate) profile.")
+        print("  Set another profile as default first, or use --force.")
+        sys.exit(1)
+
+    target["revoked"] = True
+    target["revoked_at"] = datetime.now().isoformat()
+    target["revoked_by"] = operator
+    target["revoke_reason"] = reason
+
+    if profiles_data.get("default_profile_id") == target_id:
+        profiles_data["default_profile_id"] = None
+
+    save_profiles(profiles_data, state_path)
+
+    print(f"[OK] Profile '{target.get('name')}' ({target_id}) revoked (soft-deleted).")
+    print(f"  Reason: {reason}")
+    print(f"  Revoked by: {operator}")
+    print()
+    print("  Profile data is preserved for audit. Use 'profile_list' to see all profiles including revoked.")
+    print()
+
+
+def cmd_profile_set_default(args, rules):
+    state_path = args.state
+    identifier = args.profile
+    operator = getattr(args, "operator", None) or _get_identity()
+
+    if not identifier:
+        print("[ERROR] Profile name or ID is required.")
+        sys.exit(1)
+
+    profiles_data = load_profiles(state_path)
+    profiles = profiles_data["profiles"]
+
+    target_id = None
+    target = None
+    if identifier in profiles:
+        target_id = identifier
+        target = profiles[identifier]
+    else:
+        for pid, p in profiles.items():
+            if p.get("name") == identifier and not p.get("revoked"):
+                target_id = pid
+                target = p
+                break
+
+    if target is None:
+        print(f"[ERROR] Profile '{identifier}' not found.")
+        sys.exit(1)
+
+    if target.get("revoked"):
+        print(f"[ERROR] Cannot set revoked profile as default: '{target.get('name')}'")
+        sys.exit(1)
+
+    old_default_id = profiles_data.get("default_profile_id")
+    old_default_name = (
+        profiles.get(old_default_id, {}).get("name") if old_default_id in profiles else None
+    )
+
+    profiles_data["default_profile_id"] = target_id
+    profiles_data.setdefault("switch_history", []).append({
+        "ts": datetime.now().isoformat(),
+        "operator": operator,
+        "from_profile_id": old_default_id,
+        "from_name": old_default_name,
+        "to_profile_id": target_id,
+        "to_name": target.get("name"),
+        "diff_summary": "default-only (no state switch)",
+        "has_conflicts": False,
+        "conflict_warnings": [],
+        "became_default": True,
+        "restart_activated": False,
+    })
+    save_profiles(profiles_data, state_path)
+
+    print("[OK] Default profile set (restart-safe).")
+    print(f"  Old default: {old_default_name or '(none)'} ({old_default_id or 'N/A'})")
+    print(f"  New default: {target.get('name')} ({target_id})")
+    print()
+    print("  This profile will be auto-activated for any fresh state or when explicit --profile default is used.")
+    print()
+
+
+def cmd_profile_detail(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    profiles_data = load_profiles(state_path)
+    profiles = profiles_data["profiles"]
+    identifier = getattr(args, "profile", None)
+
+    target = None
+    target_id = None
+    if identifier is None:
+        active_id = _get_active_profile_from_state_or_default(state, state_path)
+        if active_id and active_id in profiles:
+            target_id = active_id
+            target = profiles[active_id]
+    elif identifier in profiles:
+        target_id = identifier
+        target = profiles[identifier]
+    else:
+        for pid, p in profiles.items():
+            if p.get("name") == identifier:
+                target_id = pid
+                target = p
+                break
+
+    if target is None:
+        if identifier is None:
+            print("[INFO] No active or default profile. Use profile_save to create one.")
+        else:
+            print(f"[ERROR] Profile '{identifier}' not found.")
+        return
+
+    print("\n" + "=" * 70)
+    print(f"PROFILE DETAIL: {target.get('name')} ({target_id})")
+    print("=" * 70)
+    print()
+    print(f"  Name:          {target.get('name')}")
+    if target.get("description"):
+        print(f"  Description:   {target['description']}")
+    if target.get("tags"):
+        print(f"  Tags:          {', '.join(target['tags'])}")
+    print(f"  Created:       {target.get('created_at')} by {target.get('created_by')}")
+    print(f"  Rules ver:     {target.get('rules_version', '')[:16]}...")
+    print(f"  Checksum:      {target.get('rules_checksum', '')[:16]}...")
+    if target.get("state_version_at_save"):
+        print(f"  At save time:  state v{target.get('state_version_at_save')} / draft v{target.get('state_draft_version_at_save', 0)}")
+    if profiles_data.get("default_profile_id") == target_id:
+        print(f"  Default:       YES (restart auto-activate)")
+    if state and state.get("active_profile_id") == target_id:
+        print(f"  Active:        YES (linked in current state)")
+        if state.get("profile_overrides"):
+            print(f"  Overrides:     {len(state['profile_overrides'])} local drifts vs profile (run profile_diff)")
+    if target.get("revoked"):
+        print(f"  Revoked:       YES - {target.get('revoked_at')} by {target.get('revoked_by')}")
+        print(f"  Reason:        {target.get('revoke_reason', '')}")
+    print()
+
+    snap = target.get("rules_snapshot", {})
+    print(f"  [Rules Snapshot]")
+    for key, pretty in [
+        ("required_sections", "Required Sections"),
+        ("valid_risk_levels", "Valid Risk Levels"),
+        ("required_fields_per_item", "Required Fields"),
+        ("categories", "Categories"),
+    ]:
+        vals = snap.get(key, [])
+        print(f"    {pretty}: {', '.join(vals) if vals else '(empty)'}")
+    print()
+
+    switch_hist = profiles_data.get("switch_history", [])
+    uses = [s for s in switch_hist if s.get("to_profile_id") == target_id]
+    if uses:
+        print(f"  [Usage History: {len(uses)} switch(es) to this profile]")
+        for s in uses[-5:]:
+            tags = []
+            if s.get("became_default"):
+                tags.append("[DEFAULT]")
+            if s.get("restart_activated"):
+                tags.append("[AUTO-ON-RESTART]")
+            if s.get("rollback_reason"):
+                tags.append("[ROLLBACK]")
+            tag_str = "".join(tags)
+            print(f"    [{s.get('ts', '')[:19]}] {s.get('from_name', 'N/A')} -> {target.get('name')}"
+                  f"{tag_str} by {s.get('operator', '')}")
+    print("=" * 70)
+    print()
 
 
 def _apply_rules_upgrade_to_state(state, old_rules, new_rules, impact, decisions, operator):
@@ -1036,6 +2016,18 @@ def cmd_export_package(args, rules):
         print(f"   Rules snapshot: included")
     else:
         print(f"   Rules snapshot: excluded")
+    pinfo = package.get("profile_info")
+    if pinfo:
+        print(f"   Profile:        {pinfo.get('profile_name') or '(unnamed)'} (id={pinfo.get('profile_id','?')[:12]}...)")
+        if pinfo.get("profile_overrides_summary"):
+            parts = []
+            for k, s in pinfo["profile_overrides_summary"].items():
+                parts.append(f"{k}:+{s['added_count']}/-{s['removed_count']}")
+            print(f"   Profile overrides: {', '.join(parts)}")
+        if pinfo.get("last_profile_switch_at"):
+            print(f"   Last switch:    {pinfo['last_profile_switch_at']} by {pinfo.get('last_profile_switch_by','?')}")
+    else:
+        print(f"   Profile:        (none - consider profile_save to register rules baseline)")
 
     summary = package.get("handover_summary", {})
     print()
@@ -1089,6 +2081,51 @@ def cmd_import_package(args, rules):
 
     target_state_snapshot = copy.deepcopy(target_state) if target_state else None
 
+    requested_profile_id = None
+    requested_profile = None
+    profiles_data = load_profiles(state_path)
+    if target_state is not None:
+        _ensure_state_profile_fields(target_state)
+
+    if getattr(args, "profile", None):
+        identifier = args.profile
+        rid, rpd, err = _resolve_profile_identifier(state_path, identifier, include_revoked=False)
+        if err == "not_found":
+            print(f"[ERROR] Profile '{identifier}' not found locally.")
+            print("  Use 'profile_list' to see available profiles.")
+            sys.exit(1)
+        if err == "revoked":
+            print(f"[ERROR] Profile '{identifier}' is revoked. Choose another profile.")
+            sys.exit(1)
+        requested_profile_id = rid
+        requested_profile = rpd["profiles"][rid]
+        print(f"[INFO] Will apply profile '{requested_profile.get('name')}' for reconciliation.")
+        if target_state is None:
+            target_state = _new_state("UNKNOWN", "profile-import-batch")
+            _ensure_state_profile_fields(target_state)
+        _apply_profile_to_state_and_rules(
+            target_state, requested_profile, args.rules, operator, "import_package_profile"
+        )
+        profiles_data = rpd
+        profiles_data.setdefault("switch_history", []).append({
+            "ts": datetime.now().isoformat(),
+            "operator": operator,
+            "from_profile_id": target_state.get("active_profile_id"),
+            "from_name": target_state.get("active_profile_name"),
+            "to_profile_id": requested_profile_id,
+            "to_name": requested_profile.get("name"),
+            "action_source": "import_package",
+            "restart_activated": False,
+        })
+        save_profiles(profiles_data, state_path)
+        rules = load_rules(args.rules)
+        print()
+
+    active_profile_id = (target_state.get("active_profile_id") if target_state else None) or profiles_data.get("default_profile_id")
+    active_profile = None
+    if active_profile_id and active_profile_id in profiles_data["profiles"]:
+        active_profile = profiles_data["profiles"][active_profile_id]
+
     print(f"\n{'=' * 70}")
     print(f"PACKAGE IMPORT - READ-ONLY RECONCILE (NOT YET CONFIRMED)")
     print(f"{'=' * 70}")
@@ -1099,6 +2136,13 @@ def cmd_import_package(args, rules):
     print(f"   Package state:   v{package_state.get('version')} / draft v{package_state.get('draft_version')}")
     print(f"   Import mode:     {mode}")
     print(f"   Imported by:     {operator}")
+    pinfo = package.get("profile_info")
+    if pinfo:
+        print(f"   Package profile: {pinfo.get('profile_name') or '(unnamed)'} (id={pinfo.get('profile_id','?')[:12]}...)")
+    if active_profile_id:
+        print(f"   Local profile:   {active_profile.get('name') if active_profile else '(unknown)'} (id={active_profile_id[:12]}...)")
+    elif not requested_profile_id:
+        print(f"   Local profile:   (none)")
     print()
 
     age_info = None
@@ -1160,6 +2204,12 @@ def cmd_import_package(args, rules):
         target_state, package, args.rules, existing_pkg_info
     )
 
+    if not getattr(args, "no_profile_conflict_warn", False):
+        profile_conflicts = _detect_profile_conflicts(package, profiles_data, active_profile_id, active_profile)
+        for pc in profile_conflicts:
+            pc["from_profile_detection"] = True
+        conflicts.extend(profile_conflicts)
+
     if conflicts:
         print(f"[CONFLICTS DETECTED] ({len(conflicts)})")
         for i, c in enumerate(conflicts, 1):
@@ -1168,7 +2218,8 @@ def cmd_import_package(args, rules):
                 "medium": "[MED]",
                 "low": "[LOW]",
             }.get(c.get("severity", "medium"), "[MED]")
-            print(f"  {i}. {sev_tag} {c['type']}: {c['message']}")
+            src_tag = " [PROFILE]" if c.get("from_profile_detection") else ""
+            print(f"  {i}. {sev_tag} {c['type']}{src_tag}: {c['message']}")
             opts = c.get("resolution_options", [])
             if opts:
                 print(f"     Resolution options: {', '.join(opts)}")
@@ -1252,6 +2303,7 @@ def cmd_import_package(args, rules):
     )
     state_for_pending.setdefault("takeover_history", [])
     state_for_pending.setdefault("confirmed_takeover_sessions", {})
+    _ensure_state_profile_fields(state_for_pending)
     state_for_pending["pending_takeover"] = {
         "takeover_id": pending_takeover_id,
         "imported_at": datetime.now().isoformat(),
@@ -1284,6 +2336,12 @@ def cmd_import_package(args, rules):
         "confirmed_by": None,
         "decisions_log": [],
         "resumed_across_restart": False,
+        "requested_profile_id": requested_profile_id,
+        "requested_profile_name": requested_profile.get("name") if requested_profile else None,
+        "active_profile_id_at_import": active_profile_id,
+        "active_profile_name_at_import": active_profile.get("name") if active_profile else None,
+        "package_profile_info": package.get("profile_info"),
+        "profile_conflicts_count": len([c for c in conflicts if c.get("from_profile_detection")]),
     }
 
     if package.get("rules_snapshot") and args.apply_rules_snapshot:
@@ -1959,6 +3017,44 @@ def _render_markdown(state):
         lines.append("")
 
     lines.append("---")
+    lines.append("")
+    lines.append("## Rules Profile Trace")
+    lines.append("")
+    apid = state.get("active_profile_id")
+    apname = state.get("active_profile_name")
+    if apid or apname:
+        lines.append(f"- **Active Profile**: `{apname or '(unnamed)'}` (id: `{apid[:16] + '...' if apid and len(apid) > 16 else apid}`)")
+        lsa = state.get("last_profile_switch_at")
+        lsb = state.get("last_profile_switch_by")
+        if lsa:
+            lines.append(f"- **Last Profile Switch**: {lsa} by {lsb or '(unknown)'}")
+        overrides = state.get("profile_overrides", {})
+        if overrides:
+            lines.append("- **Overrides vs Profile Baseline**:")
+            for k, v in overrides.items():
+                if isinstance(v, dict):
+                    add = v.get("added_by_state", v.get("added", []))
+                    rem = v.get("removed_by_state", v.get("removed", []))
+                    if add or rem:
+                        parts = []
+                        if add:
+                            parts.append(f"+{len(add)} added")
+                        if rem:
+                            parts.append(f"-{len(rem)} removed")
+                        lines.append(f"  - `{k}`: {', '.join(parts)}")
+        switch_hist = state.get("profile_switch_history", [])
+        if switch_hist:
+            lines.append("- **Recent Switch History** (last 5):")
+            for entry in switch_hist[-5:]:
+                fn = entry.get("from_name") or entry.get("from_profile_id") or "(none)"
+                tn = entry.get("to_name") or entry.get("to_profile_id") or "(?)"
+                ts = entry.get("ts", "?")
+                op = entry.get("operator", "?")
+                act = entry.get("action", "")
+                lines.append(f"  - {ts}: `{fn}` → `{tn}` by {op} ({act})")
+    else:
+        lines.append("_No rules profile registered. Consider `profile_save` to register a rules baseline._")
+    lines.append("")
     lines.append(f"_Generated at {datetime.now().isoformat()} | Draft v{state.get('draft_version', 0)}_")
     return "\n".join(lines)
 
@@ -2406,6 +3502,62 @@ def cmd_status(args, rules):
     print(f"Draft history: {len(state.get('drafts', []))} draft(s)")
     print(f"Audit entries:  {len(state.get('audit_log', []))}")
 
+    _ensure_state_profile_fields(state)
+    profiles_data = load_profiles(state_path)
+    default_pid = profiles_data.get("default_profile_id")
+    active_pid = state.get("active_profile_id")
+    active_name = state.get("active_profile_name")
+    if active_pid and active_pid in profiles_data.get("profiles", {}):
+        prof = profiles_data["profiles"][active_pid]
+        active_name = active_name or prof.get("name")
+    default_name = None
+    if default_pid and default_pid in profiles_data.get("profiles", {}):
+        default_name = profiles_data["profiles"][default_pid].get("name")
+    has_profiles = bool(profiles_data.get("profiles"))
+
+    print()
+    print("== Rules Profiles ==")
+    if has_profiles:
+        print(f"Profiles total: {len(profiles_data.get('profiles', {}))}")
+    else:
+        print("Profiles total: 0 (run profile_save to register rules baseline)")
+    if active_pid:
+        drift_tag = ""
+        if state.get("rules_version") and active_pid in profiles_data.get("profiles", {}):
+            prof = profiles_data["profiles"][active_pid]
+            if prof.get("rules_version") and prof["rules_version"] != state.get("rules_version"):
+                drift_tag = " [DRIFT vs profile]"
+        print(f"Active profile:  {active_name or '(unknown)'} (id={active_pid[:12]}...){drift_tag}")
+    else:
+        print(f"Active profile:  (none)")
+    if default_pid:
+        print(f"Default profile: {default_name or '(unknown)'} (id={default_pid[:12]}...) [restart-safe]")
+    else:
+        print(f"Default profile: (none - use profile_set_default for restart recovery)")
+    overrides = state.get("profile_overrides", {})
+    if overrides:
+        override_parts = []
+        for k, v in overrides.items():
+            if isinstance(v, dict):
+                add = len(v.get("added_by_state", []))
+                rem = len(v.get("removed_by_state", []))
+                if add or rem:
+                    override_parts.append(f"{k}:+{add}/-{rem}")
+        if override_parts:
+            print(f"Overrides:       {', '.join(override_parts)}")
+    last_sw = state.get("last_profile_switch_at")
+    if last_sw:
+        print(f"Last switch:     {last_sw} by {state.get('last_profile_switch_by', '?')}")
+    switch_hist = state.get("profile_switch_history", [])
+    if switch_hist:
+        print(f"Switch history:  {len(switch_hist)} total")
+        for entry in switch_hist[-3:]:
+            fn = entry.get("from_name") or entry.get("from_profile_id") or "(none)"
+            tn = entry.get("to_name") or entry.get("to_profile_id") or "(?)"
+            tag = " [AUTO-ON-RESTART]" if entry.get("restart_activated") else ""
+            print(f"  - {entry.get('ts','?')}: {fn} -> {tn}{tag} ({entry.get('action','')})")
+    print()
+
     pending = state.get("pending_takeover")
     if pending:
         print()
@@ -2539,9 +3691,13 @@ def cmd_audit_view(args, rules):
     state.setdefault("confirmed_takeover_sessions", {})
     state.setdefault("rules_upgrade_handover_history", [])
     state.setdefault("imported_rules_upgrade_packages", [])
+    _ensure_state_profile_fields(state)
     takeover_history = state.get("takeover_history", [])
     sessions = state.get("confirmed_takeover_sessions", {})
     ru_imports = state.get("imported_rules_upgrade_packages", [])
+    profile_switch_history = state.get("profile_switch_history", [])
+    profiles_data = load_profiles(state_path)
+    global_switch_history = profiles_data.get("switch_history", [])
 
     current_pid = os.getpid()
     state_updated = False
@@ -2971,9 +4127,35 @@ def cmd_audit_view(args, rules):
                           f"by {ru_imp.get('revoked_by')} reason={ru_imp.get('revoke_reason','')[:40]}"),
             })
 
+    for entry in profile_switch_history:
+        fn = entry.get("from_name") or entry.get("from_profile_id") or "(none)"
+        tn = entry.get("to_name") or entry.get("to_profile_id") or "(?)"
+        act = entry.get("action", "")
+        all_events.append({
+            "ts": entry.get("ts"),
+            "type": "profile",
+            "action": f"profile_switch[{act}]",
+            "detail": f"{fn} -> {tn} by {entry.get('operator','?')}",
+            "resumed": entry.get("restart_activated", False),
+        })
+
+    for entry in global_switch_history:
+        fn = entry.get("from_name") or entry.get("from_profile_id") or "(none)"
+        tn = entry.get("to_name") or entry.get("to_profile_id") or "(?)"
+        act = entry.get("action_source", "global")
+        all_events.append({
+            "ts": entry.get("ts"),
+            "type": "profile",
+            "action": f"profile_global[{act}]",
+            "detail": f"{fn} -> {tn} by {entry.get('operator','?')}",
+            "resumed": entry.get("restart_activated", False),
+            "became_default": entry.get("became_default", False),
+        })
+
     all_events.sort(key=lambda x: x.get("ts", ""))
 
-    print(f"  Total events: {len(all_events)}")
+    has_profile = any(e["type"] == "profile" for e in all_events)
+    print(f"  Total events: {len(all_events)}" + (f" (including {sum(1 for e in all_events if e['type']=='profile')} profile events)" if has_profile else ""))
     print()
     for ev in all_events:
         tags = []
@@ -2981,15 +4163,19 @@ def cmd_audit_view(args, rules):
             tags.append("[PENDING]")
         if ev.get("revoked"):
             tags.append("[REVOKED]")
+        if ev.get("became_default"):
+            tags.append("[DEFAULT]")
         if ev["type"] == "takeover":
             tags.append("[TAKEOVER]")
         elif ev["type"] == "rules_upgrade_handover":
             tags.append("[RU HANDOVER]")
+        elif ev["type"] == "profile":
+            tags.append("[PROFILE]")
         if not tags:
             tags.append("[AUDIT]")
         resumed_tag = " [RESUMED]" if ev.get("resumed") else ""
         tag_str = "".join(tags)
-        print(f"  [{ev['ts']}] {tag_str}{resumed_tag} {ev['action']}: {ev['detail'][:80]}")
+        print(f"  [{ev['ts']}] {tag_str}{resumed_tag} {ev['action']}: {ev['detail'][:100]}")
 
     print("\n" + "=" * 70)
     print("AUDIT VIEW COMPLETE")
@@ -3775,10 +4961,30 @@ def cmd_rules_upgrade_check(args, rules):
         print("[ERROR] No state found. Run 'import' first.")
         sys.exit(1)
 
+    _ensure_state_profile_fields(state)
     _ensure_rules_snapshot(state, args.rules)
 
+    target_profile_id = None
+    target_profile = None
+    profiles_data = load_profiles(state_path)
+    if getattr(args, "profile", None):
+        identifier = args.profile
+        rid, rpd, err = _resolve_profile_identifier(state_path, identifier, include_revoked=False)
+        if err == "not_found":
+            print(f"[ERROR] Profile '{identifier}' not found.")
+            print("  Use 'profile_list' to see available profiles.")
+            sys.exit(1)
+        if err == "revoked":
+            print(f"[ERROR] Profile '{identifier}' is revoked.")
+            sys.exit(1)
+        target_profile_id = rid
+        target_profile = rpd["profiles"][rid]
+        print(f"[INFO] Using profile '{target_profile.get('name')}' as upgrade target.")
+        new_rules = target_profile.get("rules_snapshot") or rules
+    else:
+        new_rules = rules
+
     old_rules = state.get("rules_snapshot") or {}
-    new_rules = rules
 
     rules_diff = _compare_rules_configs(old_rules, new_rules)
 
@@ -3839,6 +5045,10 @@ def cmd_rules_upgrade_check(args, rules):
         "decisions": {},
         "decisions_log": [],
         "resumed_across_restart": False,
+        "target_profile_id": target_profile_id,
+        "target_profile_name": target_profile.get("name") if target_profile else None,
+        "active_profile_id_at_check": state.get("active_profile_id"),
+        "active_profile_name_at_check": state.get("active_profile_name"),
     }
 
     state["pending_rules_upgrade"] = pending
@@ -3857,6 +5067,10 @@ def cmd_rules_upgrade_check(args, rules):
     print(f"  Checked at:        {pending['checked_at']}")
     print(f"  Old rules version: {state.get('rules_version', 'N/A')[:16]}...")
     print(f"  New rules version: {_compute_rules_checksum(new_rules)[:16]}...")
+    if target_profile_id:
+        print(f"  Target profile:    {target_profile.get('name')} (id={target_profile_id[:12]}...)")
+    if state.get("active_profile_id"):
+        print(f"  Active profile:    {state.get('active_profile_name', '(unknown)')} (id={state['active_profile_id'][:12]}...)")
     print()
 
     print("[Rules Configuration Changes]")
@@ -3944,10 +5158,46 @@ def cmd_rules_upgrade_apply(args, rules):
         print("[ERROR] No state found. Run 'import' first.")
         sys.exit(1)
 
+    _ensure_state_profile_fields(state)
+
+    requested_profile_id = None
+    requested_profile = None
+    if getattr(args, "profile", None):
+        identifier = args.profile
+        rid, rpd, err = _resolve_profile_identifier(state_path, identifier, include_revoked=False)
+        if err == "not_found":
+            print(f"[ERROR] Profile '{identifier}' not found.")
+            sys.exit(1)
+        if err == "revoked":
+            print(f"[ERROR] Profile '{identifier}' is revoked.")
+            sys.exit(1)
+        requested_profile_id = rid
+        requested_profile = rpd["profiles"][rid]
+        operator = getattr(args, "operator", None) or _get_identity()
+        print(f"[INFO] Applying profile '{requested_profile.get('name')}' via rules_upgrade_apply.")
+        _apply_profile_to_state_and_rules(
+            state, requested_profile, args.rules, operator, "rules_upgrade_apply_profile"
+        )
+        rpd.setdefault("switch_history", []).append({
+            "ts": datetime.now().isoformat(),
+            "operator": operator,
+            "from_profile_id": state.get("active_profile_id"),
+            "from_name": state.get("active_profile_name"),
+            "to_profile_id": requested_profile_id,
+            "to_name": requested_profile.get("name"),
+            "action_source": "rules_upgrade_apply",
+            "restart_activated": False,
+        })
+        save_profiles(rpd, state_path)
+        save_state(state, state_path)
+        print(f"[OK] Profile applied. Active profile now: {requested_profile.get('name')}")
+        return
+
     pending = state.get("pending_rules_upgrade")
     if pending is None:
         print("[ERROR] No pending rules upgrade found.")
         print("  Run 'rules_upgrade_check' first to detect and preview changes.")
+        print("  Or use --profile <NAME_OR_ID> to apply a registered profile directly.")
         sys.exit(1)
 
     if pending.get("status") != "pending_confirmation":
@@ -5342,6 +6592,44 @@ def _render_markdown(state):
                 lines.append("")
 
     lines.append("---")
+    lines.append("")
+    lines.append("## Rules Profile Trace")
+    lines.append("")
+    apid = state.get("active_profile_id")
+    apname = state.get("active_profile_name")
+    if apid or apname:
+        lines.append(f"- **Active Profile**: `{apname or '(unnamed)'}` (id: `{apid[:16] + '...' if apid and len(apid) > 16 else apid}`)")
+        lsa = state.get("last_profile_switch_at")
+        lsb = state.get("last_profile_switch_by")
+        if lsa:
+            lines.append(f"- **Last Profile Switch**: {lsa} by {lsb or '(unknown)'}")
+        overrides = state.get("profile_overrides", {})
+        if overrides:
+            lines.append("- **Overrides vs Profile Baseline**:")
+            for k, v in overrides.items():
+                if isinstance(v, dict):
+                    add = v.get("added_by_state", v.get("added", []))
+                    rem = v.get("removed_by_state", v.get("removed", []))
+                    if add or rem:
+                        parts = []
+                        if add:
+                            parts.append(f"+{len(add)} added")
+                        if rem:
+                            parts.append(f"-{len(rem)} removed")
+                        lines.append(f"  - `{k}`: {', '.join(parts)}")
+        switch_hist = state.get("profile_switch_history", [])
+        if switch_hist:
+            lines.append("- **Recent Switch History** (last 5):")
+            for entry in switch_hist[-5:]:
+                fn = entry.get("from_name") or entry.get("from_profile_id") or "(none)"
+                tn = entry.get("to_name") or entry.get("to_profile_id") or "(?)"
+                ts = entry.get("ts", "?")
+                op = entry.get("operator", "?")
+                act = entry.get("action", "")
+                lines.append(f"  - {ts}: `{fn}` → `{tn}` by {op} ({act})")
+    else:
+        lines.append("_No rules profile registered. Consider `profile_save` to register a rules baseline._")
+    lines.append("")
     lines.append(f"_Generated at {datetime.now().isoformat()} | Draft v{state.get('draft_version', 0)}_")
     return "\n".join(lines)
 
@@ -5433,10 +6721,16 @@ def main():
                               help="In merge mode, keep target's imported_batches in addition to package's")
     p_import_pkg.add_argument("--apply-rules-snapshot", action="store_true",
                               help="Apply rules snapshot from package to local rules.yaml")
+    p_import_pkg.add_argument("--profile", default=None, metavar="NAME_OR_ID",
+                              help="Apply a registered rules profile before reconciliation (name or id)")
+    p_import_pkg.add_argument("--no-profile-conflict-warn", action="store_true",
+                              help="Suppress profile-vs-package conflict warnings")
 
     p_preflight = sub.add_parser("preflight_check", help="Pre-check a package without modifying state - show diffs, conflicts, recommended mode")
     p_preflight.add_argument("package", help="Path to package .json file to preflight")
     p_preflight.add_argument("--operator", help="Operator identifier (for audit, though no state is written)")
+    p_preflight.add_argument("--profile", default=None, metavar="NAME_OR_ID",
+                             help="Apply a registered rules profile before preflight check")
 
     p_audit_view = sub.add_parser("audit_view", help="Show audit timeline of takeovers - field changes, decision makers, cross-restart status")
 
@@ -5464,6 +6758,8 @@ def main():
 
     p_rules_check = sub.add_parser("rules_upgrade_check", help="Check rules upgrade impact - compare current state rules with local rules, show affected items")
     p_rules_check.add_argument("--operator", help="Operator identifier (for audit)")
+    p_rules_check.add_argument("--profile", default=None, metavar="NAME_OR_ID",
+                               help="Use a registered rules profile as target instead of local rules.yaml")
 
     p_rules_apply = sub.add_parser("rules_upgrade_apply", help="Apply pending rules upgrade with decisions")
     p_rules_apply.add_argument("--operator", help="Operator identifier (for audit & decision log)")
@@ -5473,6 +6769,8 @@ def main():
                                help="Default decision for manual conflicts (e.g. set=high, set=first_valid, skip)")
     p_rules_apply.add_argument("--per-item", default=None, metavar="id.field=val,id2.field=val2",
                                help="Per-item overrides (comma-separated, e.g. CHG-003.risk_level=high,CHG-005.category=security)")
+    p_rules_apply.add_argument("--profile", default=None, metavar="NAME_OR_ID",
+                               help="Apply a registered rules profile as part of the upgrade (writes rules.yaml)")
 
     p_rules_skip = sub.add_parser("rules_upgrade_skip", help="Skip/dismiss pending rules upgrade")
     p_rules_skip.add_argument("--operator", help="Operator identifier (for audit)")
@@ -5525,6 +6823,54 @@ def main():
     p_ru_handoff_revoke.add_argument("--force", action="store_true",
                                        help="Required to revoke a confirmed (persisted) handover import")
 
+    p_profile_save = sub.add_parser("profile_save", help="Save current rules.yaml snapshot as a named profile (for later switch, compare, rollback)")
+    p_profile_save.add_argument("--name", required=True, help="Profile name (human-readable, unique unless --force)")
+    p_profile_save.add_argument("--description", default="", help="Long-form description of what this profile represents")
+    p_profile_save.add_argument("--tags", default="", help="Comma-separated tags for categorization (e.g. v2.1,release,strict,relaxed)")
+    p_profile_save.add_argument("--operator", help="Operator identifier (for audit)")
+    p_profile_save.add_argument("--as-default", action="store_true",
+                                help="Set this profile as the restart-safe DEFAULT (auto-activated on fresh state)")
+    p_profile_save.add_argument("--set-active", action="store_true",
+                                help="Immediately activate this profile (write to rules.yaml & link state)")
+    p_profile_save.add_argument("--force", action="store_true",
+                                help="Allow saving a profile with a duplicate name (keeps old one, creates new)")
+
+    p_profile_list = sub.add_parser("profile_list", help="List all saved profiles with match status, default/active flags, recent switches")
+
+    p_profile_switch = sub.add_parser("profile_switch", help="Switch to a saved profile (updates rules.yaml, links state, records audit)")
+    p_profile_switch.add_argument("profile", help="Profile name or ID to switch to")
+    p_profile_switch.add_argument("--operator", help="Operator identifier (for audit & switch log)")
+    p_profile_switch.add_argument("--make-default", action="store_true",
+                                  help="Also set this profile as restart-safe DEFAULT")
+    p_profile_switch.add_argument("--force", action="store_true",
+                                  help="Allow switching to a revoked profile")
+
+    p_profile_diff = sub.add_parser("profile_diff", help="Compare two profiles (or current/state) field-by-field")
+    p_profile_diff.add_argument("profile_a", help="First profile: name/ID, or 'current' (local rules.yaml), or 'state' (embedded rules_snapshot)")
+    p_profile_diff.add_argument("profile_b", nargs="?", default="current",
+                                help="Second profile (default: current). Same tokens as profile_a.")
+
+    p_profile_rollback = sub.add_parser("profile_rollback", help="Rollback state rules to prior profile (auto from switch history, or explicit target)")
+    p_profile_rollback.add_argument("--profile", default=None, help="Explicit target profile name/ID (default: undo last switch)")
+    p_profile_rollback.add_argument("--reason", default="", help="Reason for rollback (written to audit)")
+    p_profile_rollback.add_argument("--operator", help="Operator identifier (for audit)")
+    p_profile_rollback.add_argument("--force", action="store_true",
+                                    help="Rollback even if state is currently APPROVED (will clear approval)")
+
+    p_profile_delete = sub.add_parser("profile_delete", help="Revoke/soft-delete a profile (preserved for audit, removed from active use)")
+    p_profile_delete.add_argument("profile", help="Profile name or ID to revoke")
+    p_profile_delete.add_argument("--reason", default="", help="Reason for deletion (stored in profile)")
+    p_profile_delete.add_argument("--operator", help="Operator identifier (for audit)")
+    p_profile_delete.add_argument("--force", action="store_true",
+                                  help="Revoke even if currently active or default")
+
+    p_profile_set_default = sub.add_parser("profile_set_default", help="Set which profile is auto-activated on restart / fresh state (restart-safe)")
+    p_profile_set_default.add_argument("profile", help="Profile name or ID to set as default")
+    p_profile_set_default.add_argument("--operator", help="Operator identifier (for audit)")
+
+    p_profile_detail = sub.add_parser("profile_detail", help="Show full profile detail - rules content, usage history, drift notes")
+    p_profile_detail.add_argument("--profile", default=None, help="Profile name or ID (default: active or default)")
+
     args = parser.parse_args()
     rules = load_rules(args.rules)
 
@@ -5557,7 +6903,66 @@ def main():
         "rules_upgrade_handover_detail": cmd_rules_upgrade_handover_detail,
         "rules_upgrade_handover_confirm": cmd_rules_upgrade_handover_confirm,
         "rules_upgrade_handover_revoke": cmd_rules_upgrade_handover_revoke,
+        "profile_save": cmd_profile_save,
+        "profile_list": cmd_profile_list,
+        "profile_switch": cmd_profile_switch,
+        "profile_diff": cmd_profile_diff,
+        "profile_rollback": cmd_profile_rollback,
+        "profile_delete": cmd_profile_delete,
+        "profile_set_default": cmd_profile_set_default,
+        "profile_detail": cmd_profile_detail,
     }
+
+    startup_commands_needing_state = {
+        "import_package", "status", "history", "audit_view",
+        "takeover_detail", "takeover_confirm", "takeover_revoke",
+        "rules_upgrade_check", "rules_upgrade_apply", "rules_upgrade_skip",
+        "rules_upgrade_undo", "rules_history",
+        "import_rules_upgrade_package", "rules_upgrade_handover_detail",
+        "rules_upgrade_handover_confirm", "rules_upgrade_handover_revoke",
+        "export_package", "draft", "confirm", "reject", "approve",
+        "rollback", "amend", "bulk_amend", "export", "preflight_check",
+        "profile_save", "profile_list", "profile_switch", "profile_diff",
+        "profile_rollback", "profile_delete", "profile_set_default", "profile_detail",
+    }
+    if args.command in startup_commands_needing_state:
+        state_path = args.state
+        state = load_state(state_path)
+        if state is not None:
+            _ensure_state_profile_fields(state)
+            profiles_data = load_profiles(state_path)
+            default_pid = profiles_data.get("default_profile_id")
+            active_pid = state.get("active_profile_id")
+            if default_pid and not active_pid and default_pid in profiles_data.get("profiles", {}):
+                default_profile = profiles_data["profiles"][default_pid]
+                if not default_profile.get("revoked"):
+                    operator = getattr(args, "operator", None) or _get_identity()
+                    print(f"[INFO] Restart recovery: activating default profile '{default_profile.get('name')}'")
+                    _apply_profile_to_state_and_rules(
+                        state, default_profile, args.rules, operator, "startup_default_profile"
+                    )
+                    switch_entry = {
+                        "ts": datetime.now().isoformat(),
+                        "operator": operator,
+                        "from_profile_id": None,
+                        "from_name": None,
+                        "to_profile_id": default_pid,
+                        "to_name": default_profile.get("name"),
+                        "action_source": "startup_recovery",
+                        "restart_activated": True,
+                        "diff_summary": "startup default activation",
+                        "has_conflicts": False,
+                        "conflict_warnings": [],
+                        "became_default": False,
+                    }
+                    profiles_data.setdefault("switch_history", []).append(switch_entry)
+                    sh = state.setdefault("profile_switch_history", [])
+                    if sh:
+                        sh[-1]["restart_activated"] = True
+                        sh[-1]["action_source"] = "startup_recovery"
+                    save_profiles(profiles_data, state_path)
+                    save_state(state, state_path)
+                    rules = load_rules(args.rules)
 
     fn = dispatch.get(args.command)
     if fn:
