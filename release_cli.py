@@ -87,6 +87,10 @@ def _new_state(version, batch_id):
         "takeover_history": [],
         "pending_takeover": None,
         "confirmed_takeover_sessions": {},
+        "rules_version": None,
+        "rules_snapshot": None,
+        "rules_upgrade_history": [],
+        "pending_rules_upgrade": None,
     }
 
 
@@ -328,6 +332,10 @@ def _build_package(state, operator, rules_path, description):
             "audit_log_count": len(state.get("audit_log", [])),
             "pending_bulk_ops_count": len(state.get("pending_bulk_ops", [])),
             "unresolved_bulk_ops": len([p for p in state.get("pending_bulk_ops", []) if not p.get("resolved")]),
+            "rules_version": state.get("rules_version"),
+            "rules_upgrade_history_count": len(state.get("rules_upgrade_history", [])),
+            "rules_upgrade_revoked_count": len([r for r in state.get("rules_upgrade_history", []) if r.get("revoked")]),
+            "has_pending_rules_upgrade": state.get("pending_rules_upgrade") is not None,
         }
     }
     return package
@@ -494,6 +502,224 @@ def _compare_rules_diff(local_rules_path, package_rules_snapshot):
         "removed": removed,
         "identical": len(added) == 0 and len(removed) == 0,
     }
+
+
+def _compute_rules_checksum(rules):
+    serialized = json.dumps(rules, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _compare_rules_configs(old_rules, new_rules):
+    result = {
+        "required_sections": {
+            "added": [],
+            "removed": [],
+            "unchanged": [],
+        },
+        "valid_risk_levels": {
+            "added": [],
+            "removed": [],
+            "unchanged": [],
+        },
+        "required_fields_per_item": {
+            "added": [],
+            "removed": [],
+            "unchanged": [],
+        },
+        "categories": {
+            "added": [],
+            "removed": [],
+            "unchanged": [],
+        },
+        "has_changes": False,
+    }
+
+    old_sections = set(old_rules.get("required_sections", []))
+    new_sections = set(new_rules.get("required_sections", []))
+    result["required_sections"]["added"] = sorted(new_sections - old_sections)
+    result["required_sections"]["removed"] = sorted(old_sections - new_sections)
+    result["required_sections"]["unchanged"] = sorted(old_sections & new_sections)
+
+    old_risks = set(old_rules.get("valid_risk_levels", []))
+    new_risks = set(new_rules.get("valid_risk_levels", []))
+    result["valid_risk_levels"]["added"] = sorted(new_risks - old_risks)
+    result["valid_risk_levels"]["removed"] = sorted(old_risks - new_risks)
+    result["valid_risk_levels"]["unchanged"] = sorted(old_risks & new_risks)
+
+    old_fields = set(old_rules.get("required_fields_per_item", []))
+    new_fields = set(new_rules.get("required_fields_per_item", []))
+    result["required_fields_per_item"]["added"] = sorted(new_fields - old_fields)
+    result["required_fields_per_item"]["removed"] = sorted(old_fields - new_fields)
+    result["required_fields_per_item"]["unchanged"] = sorted(old_fields & new_fields)
+
+    old_cats = set(old_rules.get("categories", []))
+    new_cats = set(new_rules.get("categories", []))
+    result["categories"]["added"] = sorted(new_cats - old_cats)
+    result["categories"]["removed"] = sorted(old_cats - new_cats)
+    result["categories"]["unchanged"] = sorted(old_cats & new_cats)
+
+    for key in result:
+        if key == "has_changes":
+            continue
+        if result[key]["added"] or result[key]["removed"]:
+            result["has_changes"] = True
+            break
+
+    return result
+
+
+def _assess_rules_upgrade_impact(state, old_rules, new_rules, rules_diff):
+    impact = {
+        "auto_migratable": [],
+        "confirmation_rollback_needed": [],
+        "manual_decision_required": [],
+        "summary": {
+            "total_affected_items": 0,
+            "auto_migratable_count": 0,
+            "confirmation_rollback_count": 0,
+            "manual_decision_count": 0,
+        },
+    }
+
+    items = state.get("items", [])
+    confirmations = state.get("confirmations", {})
+
+    added_sections = rules_diff["required_sections"]["added"]
+    removed_sections = rules_diff["required_sections"]["removed"]
+    for sec in added_sections:
+        if confirmations.get(sec, False):
+            impact["confirmation_rollback_needed"].append({
+                "type": "section_added",
+                "section": sec,
+                "message": f"New required section '{sec}' added - needs confirmation",
+                "auto_migratable": True,
+                "rollback_action": "unconfirm",
+            })
+        else:
+            impact["auto_migratable"].append({
+                "type": "section_added_pending",
+                "section": sec,
+                "message": f"New required section '{sec}' added (already pending)",
+                "auto_migratable": True,
+            })
+    for sec in removed_sections:
+        if confirmations.get(sec, False):
+            impact["auto_migratable"].append({
+                "type": "section_removed_confirmed",
+                "section": sec,
+                "message": f"Section '{sec}' removed from required - confirmation will be dropped",
+                "auto_migratable": True,
+            })
+        else:
+            impact["auto_migratable"].append({
+                "type": "section_removed_pending",
+                "section": sec,
+                "message": f"Section '{sec}' removed from required list",
+                "auto_migratable": True,
+            })
+
+    removed_risks = set(rules_diff["valid_risk_levels"]["removed"])
+    if removed_risks:
+        for item in items:
+            rl = item.get("risk_level", "")
+            if rl in removed_risks:
+                impact["manual_decision_required"].append({
+                    "type": "invalid_risk_level",
+                    "item_id": item.get("id"),
+                    "field": "risk_level",
+                    "old_value": rl,
+                    "valid_values": rules_diff["valid_risk_levels"]["unchanged"] + rules_diff["valid_risk_levels"]["added"],
+                    "message": f"Item {item.get('id')}: risk_level '{rl}' is no longer valid",
+                    "auto_migratable": False,
+                })
+
+    added_required_fields = set(rules_diff["required_fields_per_item"]["added"])
+    if added_required_fields:
+        for item in items:
+            for field in added_required_fields:
+                val = item.get(field, "")
+                if not val or not str(val).strip():
+                    impact["manual_decision_required"].append({
+                        "type": "missing_required_field",
+                        "item_id": item.get("id"),
+                        "field": field,
+                        "message": f"Item {item.get('id')}: missing newly required field '{field}'",
+                        "auto_migratable": False,
+                    })
+
+    removed_cats = set(rules_diff["categories"]["removed"])
+    if removed_cats:
+        for item in items:
+            cat = item.get("category", "")
+            if cat in removed_cats:
+                impact["manual_decision_required"].append({
+                    "type": "invalid_category",
+                    "item_id": item.get("id"),
+                    "field": "category",
+                    "old_value": cat,
+                    "valid_values": rules_diff["categories"]["unchanged"] + rules_diff["categories"]["added"],
+                    "message": f"Item {item.get('id')}: category '{cat}' is no longer valid",
+                    "auto_migratable": False,
+                })
+
+    mig_items = {m.get("id") for m in impact["auto_migratable"] if m.get("item_id")}
+    conf_items = {m.get("section") for m in impact["confirmation_rollback_needed"]}
+    man_items = {m.get("item_id") for m in impact["manual_decision_required"] if m.get("item_id")}
+
+    impact["summary"]["auto_migratable_count"] = len(impact["auto_migratable"])
+    impact["summary"]["confirmation_rollback_count"] = len(impact["confirmation_rollback_needed"])
+    impact["summary"]["manual_decision_count"] = len(impact["manual_decision_required"])
+    impact["summary"]["total_affected_items"] = len(mig_items | conf_items | man_items)
+
+    return impact
+
+
+def _ensure_rules_snapshot(state, rules_path):
+    if state.get("rules_snapshot") is None and rules_path and os.path.exists(rules_path):
+        rules = load_rules(rules_path)
+        state["rules_snapshot"] = copy.deepcopy(rules)
+        state["rules_version"] = _compute_rules_checksum(rules)
+
+
+def _apply_rules_upgrade_to_state(state, old_rules, new_rules, impact, decisions, operator):
+    confirmations = state.get("confirmations", {})
+
+    added_sections = set(m["section"] for m in impact["auto_migratable"]
+                         if m["type"] in ("section_added", "section_added_pending"))
+    for sec in added_sections:
+        confirmations[sec] = False
+
+    for item in impact["confirmation_rollback_needed"]:
+        if item["type"] == "section_added":
+            sec = item["section"]
+            dec_key = f"section_added:{sec}"
+            dec = decisions.get(dec_key, "unconfirm")
+            if dec == "unconfirm":
+                confirmations[sec] = False
+
+    removed_sections = set()
+    for m in impact["auto_migratable"]:
+        if m["type"] in ("section_removed_confirmed", "section_removed_pending"):
+            removed_sections.add(m["section"])
+    for sec in removed_sections:
+        if sec in confirmations:
+            del confirmations[sec]
+
+    for m in impact["manual_decision_required"]:
+        iid = m.get("item_id")
+        field = m.get("field")
+        dec_key = f"{m['type']}:{iid}:{field}"
+        dec = decisions.get(dec_key)
+        if dec and dec.get("action") == "set" and iid and field:
+            target = _find_in_list(state.get("items", []), iid)
+            if target:
+                target[field] = dec["value"]
+                _bump_item_version(target, operator=operator)
+
+    state["rules_snapshot"] = copy.deepcopy(new_rules)
+    state["rules_version"] = _compute_rules_checksum(new_rules)
+
+    return state
 
 
 def _suggest_import_mode(age_info, deep_diff, target_state):
@@ -1823,6 +2049,10 @@ def cmd_import(args, rules):
     for sec in rules.get("required_sections", []):
         state.setdefault("confirmations", {}).setdefault(sec, False)
 
+    if state.get("rules_snapshot") is None:
+        state["rules_snapshot"] = copy.deepcopy(rules)
+        state["rules_version"] = _compute_rules_checksum(rules)
+
     _audit(state, "import", f"batch={batch_id}, version={version}, items={len(new_items)}")
     save_state(state, state_path)
     print(f"[OK] Imported {len(new_items)} items from batch '{batch_id}' (version {version})")
@@ -2213,6 +2443,32 @@ def cmd_status(args, rules):
         for t in revoked:
             print(f"  - {t.get('takeover_id')} revoked by {t.get('revoked_by')} @ {t.get('revoked_at')}"
                   f" reason={t.get('revoke_reason','')[:40]}")
+
+    rules_version = state.get("rules_version")
+    if rules_version:
+        print()
+        print(f"Rules version:   {rules_version[:16]}...")
+        rules_hist = state.get("rules_upgrade_history", [])
+        if rules_hist:
+            active = [r for r in rules_hist if not r.get("revoked")]
+            revoked_rules = [r for r in rules_hist if r.get("revoked")]
+            print(f"Rules upgrades:  {len(rules_hist)} total ({len(active)} active, {len(revoked_rules)} revoked)")
+
+    pending_rules = state.get("pending_rules_upgrade")
+    if pending_rules:
+        print()
+        print(f"{'=' * 60}")
+        print(f"[RULES UPGRADE: PENDING]")
+        print(f"  Upgrade ID:    {pending_rules.get('upgrade_id', '?')}")
+        print(f"  Checked at:    {pending_rules.get('checked_at')}")
+        impact = pending_rules.get("impact", {}).get("summary", {})
+        print(f"  Auto-migrate:  {impact.get('auto_migratable_count', 0)}")
+        print(f"  Conf rollback: {impact.get('confirmation_rollback_count', 0)}")
+        print(f"  Manual dec:    {impact.get('manual_decision_count', 0)}")
+        if pending_rules.get("resumed_across_restart"):
+            print(f"  Resumed:       Yes (cross-restart)")
+        print(f"  Next:          rules_upgrade_apply | rules_upgrade_skip")
+        print(f"{'=' * 60}")
 
 
 def cmd_history(args, rules):
@@ -3316,6 +3572,561 @@ def _cmd_bulk_resume(args, rules, state):
         print(f"  Sections invalidated (re-confirm required): {invalidated}")
 
 
+def cmd_rules_upgrade_check(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found. Run 'import' first.")
+        sys.exit(1)
+
+    _ensure_rules_snapshot(state, args.rules)
+
+    old_rules = state.get("rules_snapshot") or {}
+    new_rules = rules
+
+    rules_diff = _compare_rules_configs(old_rules, new_rules)
+
+    if not rules_diff["has_changes"]:
+        print("\n" + "=" * 70)
+        print("RULES UPGRADE CHECK")
+        print("=" * 70)
+        print()
+        print("  Local rules are IDENTICAL to state rules snapshot.")
+        print("  No upgrade needed.")
+        print()
+        print(f"  Rules version (state): {state.get('rules_version', 'N/A')[:16]}...")
+        print("=" * 70)
+        print()
+        return
+
+    impact = _assess_rules_upgrade_impact(state, old_rules, new_rules, rules_diff)
+
+    current_pid = os.getpid()
+    existing_pending = state.get("pending_rules_upgrade")
+    resumed = False
+
+    if existing_pending and existing_pending.get("check_pid") is not None and \
+       existing_pending["check_pid"] != current_pid and \
+       not existing_pending.get("resumed_across_restart"):
+        audit_log = state.get("audit_log", [])
+        checked_at = existing_pending.get("checked_at", "")
+        has_subsequent_work = False
+        for event in audit_log:
+            if event.get("timestamp", "") > checked_at and \
+               event.get("action") not in ("rules_upgrade_checked", "rules_upgrade_skipped"):
+                has_subsequent_work = True
+                break
+        if has_subsequent_work:
+            existing_pending["resumed_across_restart"] = True
+            existing_pending["resumed_count"] = existing_pending.get("resumed_count", 0) + 1
+            resumed = True
+            _audit(state, "pending_rules_upgrade_resumed",
+                   f"upgrade_id={existing_pending.get('upgrade_id')} "
+                   f"old_pid={existing_pending.get('check_pid')} current_pid={current_pid}")
+
+    upgrade_id = hashlib.sha256(
+        f"{datetime.now().isoformat()}{_compute_rules_checksum(old_rules)}{_compute_rules_checksum(new_rules)}".encode()
+    ).hexdigest()[:16]
+
+    pending = {
+        "upgrade_id": upgrade_id,
+        "checked_at": datetime.now().isoformat(),
+        "checked_by": getattr(args, "operator", None) or _get_identity(),
+        "check_pid": current_pid,
+        "old_rules_snapshot": copy.deepcopy(old_rules),
+        "new_rules_snapshot": copy.deepcopy(new_rules),
+        "old_rules_version": state.get("rules_version"),
+        "new_rules_version": _compute_rules_checksum(new_rules),
+        "rules_diff": rules_diff,
+        "impact": impact,
+        "status": "pending_confirmation",
+        "decisions": {},
+        "decisions_log": [],
+        "resumed_across_restart": False,
+    }
+
+    state["pending_rules_upgrade"] = pending
+    _audit(state, "rules_upgrade_checked",
+           f"upgrade_id={upgrade_id} "
+           f"auto_migratable={impact['summary']['auto_migratable_count']} "
+           f"conf_rollback={impact['summary']['confirmation_rollback_count']} "
+           f"manual_decision={impact['summary']['manual_decision_count']}")
+    save_state(state, state_path)
+
+    print("\n" + "=" * 70)
+    print("RULES UPGRADE CHECK - IMPACT ANALYSIS")
+    print("=" * 70)
+    print()
+    print(f"  Upgrade ID:        {upgrade_id}")
+    print(f"  Checked at:        {pending['checked_at']}")
+    print(f"  Old rules version: {state.get('rules_version', 'N/A')[:16]}...")
+    print(f"  New rules version: {_compute_rules_checksum(new_rules)[:16]}...")
+    print()
+
+    print("[Rules Configuration Changes]")
+    print()
+    print(f"  Required sections:  +{len(rules_diff['required_sections']['added'])} "
+          f"-{len(rules_diff['required_sections']['removed'])}")
+    if rules_diff['required_sections']['added']:
+        print(f"    + Added:   {', '.join(rules_diff['required_sections']['added'])}")
+    if rules_diff['required_sections']['removed']:
+        print(f"    - Removed: {', '.join(rules_diff['required_sections']['removed'])}")
+
+    print(f"  Valid risk levels:  +{len(rules_diff['valid_risk_levels']['added'])} "
+          f"-{len(rules_diff['valid_risk_levels']['removed'])}")
+    if rules_diff['valid_risk_levels']['added']:
+        print(f"    + Added:   {', '.join(rules_diff['valid_risk_levels']['added'])}")
+    if rules_diff['valid_risk_levels']['removed']:
+        print(f"    - Removed: {', '.join(rules_diff['valid_risk_levels']['removed'])}")
+
+    print(f"  Required fields:    +{len(rules_diff['required_fields_per_item']['added'])} "
+          f"-{len(rules_diff['required_fields_per_item']['removed'])}")
+    if rules_diff['required_fields_per_item']['added']:
+        print(f"    + Added:   {', '.join(rules_diff['required_fields_per_item']['added'])}")
+    if rules_diff['required_fields_per_item']['removed']:
+        print(f"    - Removed: {', '.join(rules_diff['required_fields_per_item']['removed'])}")
+
+    print(f"  Categories:         +{len(rules_diff['categories']['added'])} "
+          f"-{len(rules_diff['categories']['removed'])}")
+    if rules_diff['categories']['added']:
+        print(f"    + Added:   {', '.join(rules_diff['categories']['added'])}")
+    if rules_diff['categories']['removed']:
+        print(f"    - Removed: {', '.join(rules_diff['categories']['removed'])}")
+
+    print()
+    print("[Impact on Current State]")
+    print()
+    s = impact["summary"]
+    print(f"  Total affected items:    {s['total_affected_items']}")
+    print(f"  Auto-migratable:         {s['auto_migratable_count']}")
+    print(f"  Confirmation rollbacks:  {s['confirmation_rollback_count']}")
+    print(f"  Manual decisions needed: {s['manual_decision_count']}")
+    print()
+
+    if impact["auto_migratable"]:
+        print("[Auto-Migratable Changes]")
+        for m in impact["auto_migratable"]:
+            print(f"  - {m['message']}")
+        print()
+
+    if impact["confirmation_rollback_needed"]:
+        print("[Confirmation Rollbacks Needed]")
+        for m in impact["confirmation_rollback_needed"]:
+            print(f"  - {m['message']} (action: {m['rollback_action']})")
+        print()
+
+    if impact["manual_decision_required"]:
+        print("[Manual Decisions Required]")
+        for i, m in enumerate(impact["manual_decision_required"], 1):
+            print(f"  {i}. [{m['type']}] {m['message']}")
+            if m.get("valid_values"):
+                print(f"     Valid values: {', '.join(m['valid_values'])}")
+        print()
+
+    has_manual = len(impact["manual_decision_required"]) > 0
+
+    print("=" * 70)
+    if has_manual:
+        print("STATUS: PENDING - Manual decisions required")
+        print("  Use --decision and/or --per-item to resolve conflicts during apply.")
+    else:
+        print("STATUS: READY - All changes can be auto-migrated")
+    print()
+    print("Next steps:")
+    print(f"  Apply upgrade:  release_cli.py --state {state_path} rules_upgrade_apply"
+          f"{' --decision set=high' if has_manual else ''}")
+    print(f"  Skip upgrade:   release_cli.py --state {state_path} rules_upgrade_skip")
+    print(f"  Undo upgrade:   release_cli.py --state {state_path} rules_upgrade_undo (after apply)")
+    print("=" * 70)
+    print()
+
+
+def cmd_rules_upgrade_apply(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found. Run 'import' first.")
+        sys.exit(1)
+
+    pending = state.get("pending_rules_upgrade")
+    if pending is None:
+        print("[ERROR] No pending rules upgrade found.")
+        print("  Run 'rules_upgrade_check' first to detect and preview changes.")
+        sys.exit(1)
+
+    if pending.get("status") != "pending_confirmation":
+        print(f"[ERROR] Upgrade status is '{pending.get('status')}', not pending_confirmation.")
+        sys.exit(1)
+
+    operator = getattr(args, "operator", None) or _get_identity()
+    mode = getattr(args, "mode", "auto")
+    default_decision = getattr(args, "decision", None)
+    per_item_raw = getattr(args, "per_item", None)
+
+    current_pid = os.getpid()
+    if pending.get("check_pid") is not None and pending["check_pid"] != current_pid and \
+       not pending.get("resumed_across_restart"):
+        audit_log = state.get("audit_log", [])
+        checked_at = pending.get("checked_at", "")
+        has_subsequent_work = False
+        for event in audit_log:
+            if event.get("timestamp", "") > checked_at and \
+               event.get("action") not in ("rules_upgrade_checked", "rules_upgrade_skipped"):
+                has_subsequent_work = True
+                break
+        if has_subsequent_work:
+            pending["resumed_across_restart"] = True
+            pending["resumed_count"] = pending.get("resumed_count", 0) + 1
+            _audit(state, "pending_rules_upgrade_resumed",
+                   f"upgrade_id={pending.get('upgrade_id')} old_pid={pending.get('check_pid')} current_pid={current_pid}")
+
+    impact = pending["impact"]
+    old_rules = pending["old_rules_snapshot"]
+    new_rules = pending["new_rules_snapshot"]
+    upgrade_id = pending["upgrade_id"]
+
+    decisions = {}
+    decisions_log = []
+    ts_now = datetime.now().isoformat()
+
+    if impact["confirmation_rollback_needed"]:
+        for m in impact["confirmation_rollback_needed"]:
+            sec = m["section"]
+            key = f"section_added:{sec}"
+            decisions[key] = "unconfirm"
+            decisions_log.append({
+                "ts": ts_now,
+                "type": "section_added",
+                "section": sec,
+                "decision": "unconfirm",
+                "operator": operator,
+                "detail": f"section {sec} unconfirmed due to new required section",
+            })
+
+    manual_items = impact["manual_decision_required"]
+    per_item_decision = {}
+    if per_item_raw:
+        for pair in per_item_raw.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                per_item_decision[k.strip()] = v.strip()
+
+    if manual_items:
+        for m in manual_items:
+            iid = m["item_id"]
+            field = m["field"]
+            key = f"{m['type']}:{iid}:{field}"
+            pi_key = f"{iid}.{field}"
+            dec = None
+
+            if pi_key in per_item_decision:
+                val = per_item_decision[pi_key]
+                dec = {"action": "set", "value": val}
+                decisions_log.append({
+                    "ts": ts_now,
+                    "type": m["type"],
+                    "item_id": iid,
+                    "field": field,
+                    "decision": f"set={val}",
+                    "operator": operator,
+                    "detail": f"per-item: {iid}.{field} = {val}",
+                })
+            elif default_decision and "=" in default_decision:
+                act, val = default_decision.split("=", 1)
+                if act == "set":
+                    if m["type"] == "invalid_risk_level" and val == "first_valid":
+                        valid_vals = m.get("valid_values", [])
+                        if valid_vals:
+                            dec = {"action": "set", "value": valid_vals[0]}
+                            decisions_log.append({
+                                "ts": ts_now,
+                                "type": m["type"],
+                                "item_id": iid,
+                                "field": field,
+                                "decision": f"set_first_valid={valid_vals[0]}",
+                                "operator": operator,
+                                "detail": f"default: first valid value for {iid}.{field}",
+                            })
+                    else:
+                        dec = {"action": "set", "value": val}
+                        decisions_log.append({
+                            "ts": ts_now,
+                            "type": m["type"],
+                            "item_id": iid,
+                            "field": field,
+                            "decision": f"set={val}",
+                            "operator": operator,
+                            "detail": f"default: {iid}.{field} = {val}",
+                        })
+            elif m["type"] == "missing_required_field":
+                dec = None
+            elif default_decision == "skip":
+                dec = {"action": "skip"}
+                decisions_log.append({
+                    "ts": ts_now,
+                    "type": m["type"],
+                    "item_id": iid,
+                    "field": field,
+                    "decision": "skip",
+                    "operator": operator,
+                    "detail": f"skip {iid}.{field} (manual decision needed later)",
+                })
+
+            if dec is not None:
+                decisions[key] = dec
+
+        unresolved = [
+            m for m in manual_items
+            if f"{m['type']}:{m['item_id']}:{m['field']}" not in decisions
+        ]
+        if unresolved and mode != "force":
+            print("[BLOCKED] Unresolved manual decisions:")
+            for m in unresolved:
+                print(f"  - [{m['type']}] {m['item_id']}.{m['field']}: {m['message']}")
+            print()
+            print("  Use --decision set=<value> or --per-item id.field=value,... to resolve.")
+            print("  Use --mode force to apply anyway (unresolved items will remain invalid).")
+            sys.exit(1)
+
+    pre_upgrade_state = copy.deepcopy(state)
+    _apply_rules_upgrade_to_state(state, old_rules, new_rules, impact, decisions, operator)
+
+    if state.get("approved"):
+        state["approved"] = False
+        state["approved_at_version"] = None
+        state["approved_at_draft_version"] = None
+        print("  [NOTE] Approval cleared (rules changed after approval).")
+
+    upgrade_record = {
+        "upgrade_id": upgrade_id,
+        "applied_at": datetime.now().isoformat(),
+        "applied_by": operator,
+        "old_rules_snapshot": copy.deepcopy(old_rules),
+        "new_rules_snapshot": copy.deepcopy(new_rules),
+        "old_rules_version": pending["old_rules_version"],
+        "new_rules_version": pending["new_rules_version"],
+        "rules_diff": pending["rules_diff"],
+        "impact": impact,
+        "decisions": decisions,
+        "decisions_log": decisions_log,
+        "pre_upgrade_state_snapshot": {
+            "confirmations": copy.deepcopy(pre_upgrade_state.get("confirmations", {})),
+            "items": copy.deepcopy(pre_upgrade_state.get("items", [])),
+            "approved": pre_upgrade_state.get("approved", False),
+            "approved_at_version": pre_upgrade_state.get("approved_at_version"),
+            "approved_at_draft_version": pre_upgrade_state.get("approved_at_draft_version"),
+            "rules_version": pre_upgrade_state.get("rules_version"),
+            "rules_snapshot": copy.deepcopy(pre_upgrade_state.get("rules_snapshot")),
+        },
+        "status": "applied",
+        "revoked": False,
+        "revoked_at": None,
+        "revoked_by": None,
+        "revoke_reason": None,
+    }
+
+    state.setdefault("rules_upgrade_history", []).append(upgrade_record)
+    state["pending_rules_upgrade"] = None
+
+    _audit(state, "rules_upgrade_applied",
+           f"upgrade_id={upgrade_id} operator={operator} "
+           f"auto_migratable={impact['summary']['auto_migratable_count']} "
+           f"conf_rollback={impact['summary']['confirmation_rollback_count']} "
+           f"manual_decisions_resolved={len(decisions_log)}")
+
+    save_state(state, state_path)
+
+    print("\n" + "=" * 70)
+    print("RULES UPGRADE APPLIED")
+    print("=" * 70)
+    print()
+    print(f"  Upgrade ID:        {upgrade_id}")
+    print(f"  Applied at:        {upgrade_record['applied_at']}")
+    print(f"  Applied by:        {operator}")
+    if pending.get("resumed_across_restart"):
+        print(f"  Resumed:           Yes (across restart)")
+    print(f"  Rules version:     {pending['old_rules_version'][:16]}... -> {pending['new_rules_version'][:16]}...")
+    print()
+    print(f"  Auto-migrated:     {impact['summary']['auto_migratable_count']}")
+    print(f"  Conf rollbacks:    {impact['summary']['confirmation_rollback_count']}")
+    print(f"  Manual decisions:  {len(decisions_log)} applied")
+    print()
+    print("  Entry added to rules_upgrade_history.")
+    print("  Cross-restart safe.")
+    print()
+    print("Next steps:")
+    print(f"  Review status:     release_cli.py --state {state_path} status")
+    print(f"  Undo upgrade:      release_cli.py --state {state_path} rules_upgrade_undo")
+    print("=" * 70)
+    print()
+
+
+def cmd_rules_upgrade_skip(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    pending = state.get("pending_rules_upgrade")
+    if pending is None:
+        print("[INFO] No pending rules upgrade to skip.")
+        return
+
+    operator = getattr(args, "operator", None) or _get_identity()
+    reason = getattr(args, "reason", "") or "manual skip"
+
+    upgrade_id = pending.get("upgrade_id", "?")
+    _audit(state, "rules_upgrade_skipped",
+           f"upgrade_id={upgrade_id} operator={operator} reason={reason}")
+
+    state["pending_rules_upgrade"] = None
+    save_state(state, state_path)
+
+    print(f"[OK] Pending rules upgrade {upgrade_id} skipped.")
+    print(f"  Reason: {reason}")
+    print()
+
+
+def cmd_rules_upgrade_undo(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[ERROR] No state found.")
+        sys.exit(1)
+
+    state.setdefault("rules_upgrade_history", [])
+    history = state["rules_upgrade_history"]
+
+    upgrade_id = getattr(args, "upgrade_id", None)
+    reason = getattr(args, "reason", "") or "manual undo"
+    operator = getattr(args, "operator", None) or _get_identity()
+
+    target_record = None
+    target_idx = None
+
+    if upgrade_id:
+        for i, rec in enumerate(history):
+            if rec.get("upgrade_id") == upgrade_id:
+                target_record = rec
+                target_idx = i
+                break
+    elif history:
+        for i in range(len(history) - 1, -1, -1):
+            if not history[i].get("revoked"):
+                target_record = history[i]
+                target_idx = i
+                break
+
+    if target_record is None:
+        print("[ERROR] No applied rules upgrade found to undo.")
+        if history:
+            print(f"  Total history entries: {len(history)}")
+            revoked = [r for r in history if r.get("revoked")]
+            print(f"  Already revoked: {len(revoked)}")
+        sys.exit(1)
+
+    if target_record.get("revoked"):
+        print(f"[ERROR] Upgrade {target_record.get('upgrade_id')} is already revoked.")
+        sys.exit(1)
+
+    pre_snapshot = target_record.get("pre_upgrade_state_snapshot", {})
+
+    if pre_snapshot.get("confirmations") is not None:
+        state["confirmations"] = copy.deepcopy(pre_snapshot["confirmations"])
+    if pre_snapshot.get("items") is not None:
+        state["items"] = copy.deepcopy(pre_snapshot["items"])
+    state["approved"] = pre_snapshot.get("approved", False)
+    state["approved_at_version"] = pre_snapshot.get("approved_at_version")
+    state["approved_at_draft_version"] = pre_snapshot.get("approved_at_draft_version")
+    state["rules_version"] = pre_snapshot.get("rules_version")
+    state["rules_snapshot"] = copy.deepcopy(pre_snapshot.get("rules_snapshot", {}))
+
+    ts_now = datetime.now().isoformat()
+    target_record["revoked"] = True
+    target_record["revoked_at"] = ts_now
+    target_record["revoked_by"] = operator
+    target_record["revoke_reason"] = reason
+
+    _audit(state, "rules_upgrade_undone",
+           f"upgrade_id={target_record['upgrade_id']} operator={operator} reason={reason}")
+
+    save_state(state, state_path)
+
+    print("\n" + "=" * 70)
+    print("RULES UPGRADE UNDONE")
+    print("=" * 70)
+    print()
+    print(f"  Upgrade ID:    {target_record['upgrade_id']}")
+    print(f"  Undone at:     {ts_now}")
+    print(f"  Undone by:     {operator}")
+    print(f"  Reason:        {reason}")
+    print()
+    print(f"  Rules restored to: {pre_snapshot.get('rules_version', 'N/A')[:16]}...")
+    print(f"  Confirmations restored: {len(pre_snapshot.get('confirmations', {}))} sections")
+    print(f"  Items restored: {len(pre_snapshot.get('items', []))} items")
+    print(f"  Approval status: {pre_snapshot.get('approved', False)}")
+    print()
+    print("  Undo record preserved in rules_upgrade_history.")
+    print("=" * 70)
+    print()
+
+
+def cmd_rules_history(args, rules):
+    state_path = args.state
+    state = load_state(state_path)
+    if state is None:
+        print("[INFO] No state found.")
+        return
+
+    state.setdefault("rules_upgrade_history", [])
+    history = state["rules_upgrade_history"]
+
+    if not history:
+        print("[INFO] No rules upgrade history.")
+        print("  Run 'rules_upgrade_check' to detect changes.")
+        return
+
+    pending = state.get("pending_rules_upgrade")
+
+    print("\n" + "=" * 70)
+    print("RULES UPGRADE HISTORY")
+    print("=" * 70)
+    print()
+
+    if pending:
+        print(f"[PENDING] {pending.get('upgrade_id')}")
+        print(f"  Checked at: {pending.get('checked_at')}")
+        print(f"  Checked by: {pending.get('checked_by')}")
+        print(f"  Status:     {pending.get('status')}")
+        if pending.get("resumed_across_restart"):
+            print(f"  Resumed:    Yes (cross-restart)")
+        print()
+
+    for idx, rec in enumerate(reversed(history), 1):
+        status_tag = " [REVOKED]" if rec.get("revoked") else ""
+        print(f"Upgrade #{len(history) - idx + 1}: {rec.get('upgrade_id')}{status_tag}")
+        print(f"  Applied at: {rec.get('applied_at')}")
+        print(f"  Applied by: {rec.get('applied_by')}")
+        print(f"  Old ver:    {str(rec.get('old_rules_version', ''))[:16]}...")
+        print(f"  New ver:    {str(rec.get('new_rules_version', ''))[:16]}...")
+        impact = rec.get("impact", {}).get("summary", {})
+        print(f"  Impact:     auto={impact.get('auto_migratable_count', 0)} "
+              f"rollback={impact.get('confirmation_rollback_count', 0)} "
+              f"manual={impact.get('manual_decision_count', 0)}")
+        if rec.get("revoked"):
+            print(f"  Revoked at: {rec.get('revoked_at')}")
+            print(f"  Revoked by: {rec.get('revoked_by')}")
+            print(f"  Reason:     {rec.get('revoke_reason', '')}")
+        print()
+
+    print(f"Total upgrades: {len(history)} "
+          f"(active: {len([r for r in history if not r.get('revoked')])}, "
+          f"revoked: {len([r for r in history if r.get('revoked')])})")
+    print("=" * 70)
+    print()
+
+
 def main():
     try:
         if hasattr(sys.stdout, "reconfigure"):
@@ -3432,6 +4243,29 @@ def main():
     p_tk_revoke.add_argument("--force", action="store_true",
                              help="Required to revoke a confirmed (persisted) takeover session")
 
+    p_rules_check = sub.add_parser("rules_upgrade_check", help="Check rules upgrade impact - compare current state rules with local rules, show affected items")
+    p_rules_check.add_argument("--operator", help="Operator identifier (for audit)")
+
+    p_rules_apply = sub.add_parser("rules_upgrade_apply", help="Apply pending rules upgrade with decisions")
+    p_rules_apply.add_argument("--operator", help="Operator identifier (for audit & decision log)")
+    p_rules_apply.add_argument("--mode", choices=["auto", "force"], default="auto",
+                               help="Apply mode: auto (default, blocks on unresolved) or force (apply anyway)")
+    p_rules_apply.add_argument("--decision", default=None,
+                               help="Default decision for manual conflicts (e.g. set=high, set=first_valid, skip)")
+    p_rules_apply.add_argument("--per-item", default=None, metavar="id.field=val,id2.field=val2",
+                               help="Per-item overrides (comma-separated, e.g. CHG-003.risk_level=high,CHG-005.category=security)")
+
+    p_rules_skip = sub.add_parser("rules_upgrade_skip", help="Skip/dismiss pending rules upgrade")
+    p_rules_skip.add_argument("--operator", help="Operator identifier (for audit)")
+    p_rules_skip.add_argument("--reason", default="", help="Reason for skipping")
+
+    p_rules_undo = sub.add_parser("rules_upgrade_undo", help="Undo a previously applied rules upgrade")
+    p_rules_undo.add_argument("--upgrade-id", default=None, help="Specific upgrade_id to undo (default: latest applied)")
+    p_rules_undo.add_argument("--reason", default="", help="Reason for undo (written to audit log)")
+    p_rules_undo.add_argument("--operator", help="Operator identifier (for audit)")
+
+    p_rules_hist = sub.add_parser("rules_history", help="Show rules upgrade history - applied, revoked, pending")
+
     args = parser.parse_args()
     rules = load_rules(args.rules)
 
@@ -3454,6 +4288,11 @@ def main():
         "takeover_detail": cmd_takeover_detail,
         "takeover_confirm": cmd_takeover_confirm,
         "takeover_revoke": cmd_takeover_revoke,
+        "rules_upgrade_check": cmd_rules_upgrade_check,
+        "rules_upgrade_apply": cmd_rules_upgrade_apply,
+        "rules_upgrade_skip": cmd_rules_upgrade_skip,
+        "rules_upgrade_undo": cmd_rules_upgrade_undo,
+        "rules_history": cmd_rules_history,
     }
 
     fn = dispatch.get(args.command)

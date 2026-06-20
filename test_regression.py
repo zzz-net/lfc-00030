@@ -3190,6 +3190,501 @@ def test_44_utf8_mode_encoding_stability(tmpdir):
     safe_print("  6. -X utf8 status 中文输出 ✅")
 
 
+def run_cli_with_rules(args, state_path, rules_path, expect_fail=False):
+    cmd = [sys.executable, CLI, "--rules", rules_path, "--state", state_path] + args
+    res = subprocess.run(cmd, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", cwd=SCRIPT_DIR)
+    ok = res.returncode != 0 if expect_fail else res.returncode == 0
+    if not ok:
+        safe_print(f"  [FAIL] {' '.join(args)}")
+        safe_print(f"    exit={res.returncode} expect_fail={expect_fail}")
+        if res.stdout.strip():
+            safe_print(f"    stdout: {safe_truncate(res.stdout)}")
+        if res.stderr.strip():
+            safe_print(f"    stderr: {safe_truncate(res.stderr)}")
+    else:
+        label = "(expected fail)" if expect_fail else ""
+        safe_print(f"  [OK] {' '.join(args)} {label}")
+    return res
+
+
+def _make_rules_stricter(path):
+    import yaml
+    rules = {
+        "required_sections": ["overview", "changes", "migration", "known_issues"],
+        "valid_risk_levels": ["low", "medium", "high"],
+        "required_fields_per_item": ["id", "title", "owner", "risk_level", "category"],
+        "categories": ["feature", "bugfix", "refactor", "security"],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(rules, f, allow_unicode=True, default_flow_style=False)
+
+
+def _make_rules_newer(path):
+    import yaml
+    rules = {
+        "required_sections": ["overview", "changes", "migration", "known_issues", "rollback_plan"],
+        "valid_risk_levels": ["low", "medium", "high", "critical", "blocker"],
+        "required_fields_per_item": ["id", "title", "owner", "risk_level", "category", "test_coverage"],
+        "categories": ["feature", "bugfix", "refactor", "deprecation", "removal", "security", "performance"],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(rules, f, allow_unicode=True, default_flow_style=False)
+
+
+def test_45_rules_upgrade_check_basic(tmpdir):
+    """规则升级对账：基础预检功能，规则相同时报无变更，规则不同时检测变更"""
+    print("\n== Test 45: Rules upgrade check basic ==")
+    sp = os.path.join(tmpdir, "state_t45.json")
+    cleanup_patterns(tmpdir, "state_t45.json")
+
+    print("\n  [Step 1] 导入清单...")
+    run_cli(["import", SAMPLE], sp)
+    s0 = read_state(sp)
+    assert "rules_version" in s0, "t45: import后应有 rules_version"
+    assert "rules_snapshot" in s0, "t45: import后应有 rules_snapshot"
+    original_version = s0["rules_version"]
+    safe_print(f"  初始规则版本: {original_version[:16]}...")
+
+    print("\n  [Step 2] 用相同规则检查升级（应报无变更）...")
+    res_same = run_cli(["rules_upgrade_check"], sp)
+    assert_in("IDENTICAL", res_same.stdout, "t45: 相同规则应显示 IDENTICAL")
+    assert_in("No upgrade needed", res_same.stdout, "t45: 相同规则应显示无需升级")
+
+    print("\n  [Step 3] 用更严格的规则检查升级（应检测到变更）...")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    res_stricter = run_cli_with_rules(["rules_upgrade_check"], sp, stricter_rules)
+    assert_in("IMPACT ANALYSIS", res_stricter.stdout, "t45: 规则变更应显示影响分析")
+    assert_in("Removed: critical", res_stricter.stdout, "t45: 应检测到移除 critical 风险级别")
+    assert_in("Manual decisions required", res_stricter.stdout, "t45: 应报告需人工决策")
+
+    s1 = read_state(sp)
+    assert s1.get("pending_rules_upgrade") is not None, "t45: check后应有 pending_rules_upgrade"
+    pending = s1["pending_rules_upgrade"]
+    assert pending["status"] == "pending_confirmation", "t45: pending 状态应为 pending_confirmation"
+    assert "impact" in pending, "t45: pending 应包含 impact"
+    assert "rules_diff" in pending, "t45: pending 应包含 rules_diff"
+    assert "check_pid" in pending, "t45: pending 应包含 check_pid"
+
+    safe_print(f"  待处理升级 ID: {pending['upgrade_id']}")
+    safe_print(f"  需人工决策数: {pending['impact']['summary']['manual_decision_count']}")
+
+    print("\n  [Step 4] 再用新规则检查（应覆盖旧的 pending）...")
+    newer_rules = os.path.join(tmpdir, "rules_newer.yaml")
+    _make_rules_newer(newer_rules)
+    res_newer = run_cli_with_rules(["rules_upgrade_check"], sp, newer_rules)
+    assert_in("Added:   rollback_plan", res_newer.stdout, "t45: 应检测到新增 rollback_plan 章节")
+    assert_in("Added:   test_coverage", res_newer.stdout, "t45: 应检测到新增 test_coverage 字段")
+
+    s2 = read_state(sp)
+    pending2 = s2["pending_rules_upgrade"]
+    assert pending2["upgrade_id"] != pending["upgrade_id"], "t45: 重新检查应生成新的 upgrade_id"
+
+    print("\n  [OK] 规则升级预检基础功能正常")
+    cleanup_patterns(tmpdir, "state_t45.json")
+
+
+def test_46_rules_upgrade_apply_and_undo(tmpdir):
+    """规则升级：应用决策与撤销回滚"""
+    print("\n== Test 46: Rules upgrade apply and undo ==")
+    sp = os.path.join(tmpdir, "state_t46.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t46.json")
+
+    print("\n  [Step 1] 导入并确认部分章节...")
+    run_cli(["import", SAMPLE], sp)
+    run_cli(["confirm", "overview"], sp)
+    run_cli(["confirm", "changes"], sp)
+
+    s_before = read_state(sp)
+    chg003_before = next(i for i in s_before["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_before["risk_level"], "critical", "t46: CHG-003 升级前 risk_level=critical")
+    assert_eq(chg003_before["category"], "removal", "t46: CHG-003 升级前 category=removal")
+    rules_ver_before = s_before["rules_version"]
+
+    print("\n  [Step 2] 检查升级并应用（带 per-item 决策）...")
+    run_cli_with_rules(["rules_upgrade_check"], sp, stricter_rules)
+    res_apply = run_cli_with_rules(
+        ["rules_upgrade_apply",
+         "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor",
+         "--operator", "tester_46"],
+        sp, stricter_rules
+    )
+    assert_in("RULES UPGRADE APPLIED", res_apply.stdout, "t46: apply 应显示成功")
+    assert_in("Manual decisions:  2 applied", res_apply.stdout, "t46: 应显示 2 个手动决策已应用")
+
+    s_after_apply = read_state(sp)
+    assert s_after_apply.get("pending_rules_upgrade") is None, "t46: apply后 pending 应清空"
+    assert len(s_after_apply.get("rules_upgrade_history", [])) == 1, "t46: 应有 1 条升级历史"
+    upgrade_record = s_after_apply["rules_upgrade_history"][0]
+    assert_eq(upgrade_record["applied_by"], "tester_46", "t46: 升级记录应包含操作人")
+    assert_eq(upgrade_record["revoked"], False, "t46: 新应用的升级 revoked=False")
+
+    chg003_after = next(i for i in s_after_apply["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_after["risk_level"], "high", "t46: apply后 CHG-003 risk_level=high")
+    assert_eq(chg003_after["category"], "refactor", "t46: apply后 CHG-003 category=refactor")
+    assert s_after_apply["rules_version"] != rules_ver_before, "t46: apply后 rules_version 应变更"
+
+    print("\n  [Step 3] 查看升级历史...")
+    res_history = run_cli_with_rules(["rules_history"], sp, stricter_rules)
+    assert_in("RULES UPGRADE HISTORY", res_history.stdout, "t46: history 应显示标题")
+    assert_in("tester_46", res_history.stdout, "t46: history 应显示操作人")
+    assert_in("active: 1", res_history.stdout, "t46: 应显示 1 个 active 升级")
+
+    print("\n  [Step 4] 撤销升级...")
+    res_undo = run_cli_with_rules(
+        ["rules_upgrade_undo", "--reason", "test undo", "--operator", "tester_46"],
+        sp, stricter_rules
+    )
+    assert_in("RULES UPGRADE UNDONE", res_undo.stdout, "t46: undo 应显示成功")
+    assert_in("Rules restored to", res_undo.stdout, "t46: undo 应显示规则已恢复")
+
+    s_after_undo = read_state(sp)
+    assert len(s_after_undo["rules_upgrade_history"]) == 1, "t46: undo后历史记录仍保留 1 条"
+    assert_eq(s_after_undo["rules_upgrade_history"][0]["revoked"], True, "t46: 撤销后 revoked=True")
+    assert_eq(s_after_undo["rules_upgrade_history"][0]["revoke_reason"], "test undo",
+              "t46: 撤销后应有 revoke_reason")
+
+    chg003_undo = next(i for i in s_after_undo["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_undo["risk_level"], "critical", "t46: undo后 CHG-003 risk_level 恢复为 critical")
+    assert_eq(chg003_undo["category"], "removal", "t46: undo后 CHG-003 category 恢复为 removal")
+    assert_eq(s_after_undo["rules_version"], rules_ver_before, "t46: undo后 rules_version 恢复")
+
+    print("\n  [Step 5] 再次查看历史（应显示已撤销）...")
+    res_hist2 = run_cli_with_rules(["rules_history"], sp, stricter_rules)
+    assert_in("revoked: 1", res_hist2.stdout, "t46: 历史应显示 1 个 revoked")
+
+    print("\n  [OK] 规则升级应用与撤销功能正常")
+    cleanup_patterns(tmpdir, "state_t46.json")
+
+
+def test_47_rules_upgrade_skip_and_status(tmpdir):
+    """规则升级：跳过升级、status 显示规则版本与待决升级"""
+    print("\n== Test 47: Rules upgrade skip and status display ==")
+    sp = os.path.join(tmpdir, "state_t47.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t47.json")
+
+    print("\n  [Step 1] 导入并检查升级...")
+    run_cli(["import", SAMPLE], sp)
+    run_cli_with_rules(["rules_upgrade_check"], sp, stricter_rules)
+
+    print("\n  [Step 2] status 应显示待决升级...")
+    res_status1 = run_cli_with_rules(["status"], sp, stricter_rules)
+    assert_in("RULES UPGRADE: PENDING", res_status1.stdout, "t47: status 应显示待决升级")
+    assert_in("Upgrade ID:", res_status1.stdout, "t47: status 应显示升级 ID")
+    assert_in("Manual dec:", res_status1.stdout, "t47: status 应显示人工决策数")
+
+    print("\n  [Step 3] 跳过升级...")
+    res_skip = run_cli_with_rules(
+        ["rules_upgrade_skip", "--reason", "skip for now", "--operator", "tester_47"],
+        sp, stricter_rules
+    )
+    assert_in("skipped", res_skip.stdout, "t47: skip 应显示已跳过")
+
+    s_after_skip = read_state(sp)
+    assert s_after_skip.get("pending_rules_upgrade") is None, "t47: skip后 pending 应清空"
+
+    print("\n  [Step 4] status 应不再显示待决升级，但显示规则版本...")
+    res_status2 = run_cli(["status"], sp)
+    assert_in("Rules version:", res_status2.stdout, "t47: status 应显示规则版本")
+    assert_not_in("RULES UPGRADE: PENDING", res_status2.stdout, "t47: skip后不应再显示待决升级")
+
+    print("\n  [OK] 跳过升级与 status 显示功能正常")
+    cleanup_patterns(tmpdir, "state_t47.json")
+
+
+def test_48_rules_upgrade_cross_restart_resume(tmpdir):
+    """规则升级：跨重启恢复检测 - 待决升级持久化后重启能识别为续做"""
+    print("\n== Test 48: Rules upgrade cross-restart resume detection ==")
+    sp = os.path.join(tmpdir, "state_t48.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t48.json")
+
+    print("\n  [Step 1] 导入并创建待决升级...")
+    run_cli(["import", SAMPLE], sp)
+    run_cli_with_rules(["rules_upgrade_check"], sp, stricter_rules)
+
+    s_initial = read_state(sp)
+    pending_initial = s_initial["pending_rules_upgrade"]
+    assert_eq(pending_initial.get("resumed_across_restart", False), False,
+              "t48: 初始 pending 不应有 resumed 标记")
+    original_pid = pending_initial.get("check_pid")
+    assert original_pid is not None, "t48: pending 应包含 check_pid"
+
+    print(f"  初始 check_pid: {original_pid}")
+
+    print("\n  [Step 2] 做一些后续工作（确认章节），模拟重启前的进展...")
+    run_cli(["confirm", "overview"], sp)
+    run_cli(["confirm", "changes"], sp)
+
+    print("\n  [Step 3] 模拟重启：修改 check_pid 为不同的值...")
+    s_before_restart = read_state(sp)
+    s_before_restart["pending_rules_upgrade"]["check_pid"] = 99999
+    with open(sp, "w", encoding="utf-8") as f:
+        json.dump(s_before_restart, f, ensure_ascii=False, indent=2)
+
+    print("\n  [Step 4] 重启后调用 rules_upgrade_apply（应检测为续做）...")
+    apply_script = os.path.join(tmpdir, "run_apply_t48.py")
+    with open(apply_script, "w", encoding="utf-8") as f:
+        f.write(f"""
+import sys
+sys.path.insert(0, r"{SCRIPT_DIR}")
+from release_cli import main as cli_main
+sys.argv = ["release_cli.py", "--rules", r"{stricter_rules}", "--state", r"{sp}",
+            "rules_upgrade_apply", "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor",
+            "--operator", "tester_48"]
+cli_main()
+""")
+    result = subprocess.run(
+        [sys.executable, apply_script],
+        capture_output=True,
+        cwd=SCRIPT_DIR,
+    )
+    apply_output = result.stdout.decode('utf-8', errors='replace') + result.stderr.decode('utf-8', errors='replace')
+
+    s_after_apply = read_state(sp)
+    audit_actions = [e["action"] for e in s_after_apply.get("audit_log", [])]
+    resume_events = [e for e in audit_actions if e == "pending_rules_upgrade_resumed"]
+    assert len(resume_events) >= 1, "t48: 应有 pending_rules_upgrade_resumed 审计事件"
+
+    upgrade_record = s_after_apply["rules_upgrade_history"][-1]
+    assert_in("Resumed:           Yes (across restart)", apply_output,
+              "t48: apply 输出应显示 Resumed")
+
+    print(f"  重启检测到的续做事件数: {len(resume_events)}")
+
+    print("\n  [OK] 跨重启恢复检测功能正常")
+    cleanup_patterns(tmpdir, "state_t48.json")
+
+
+def test_49_rules_upgrade_handover_preservation(tmpdir):
+    """规则升级：交接包导出导入后规则版本、升级历史、撤销记录完整保留"""
+    print("\n== Test 49: Rules upgrade preservation across handover ==")
+    sp_a = os.path.join(tmpdir, "state_t49_a.json")
+    sp_b = os.path.join(tmpdir, "state_t49_b.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t49_a.json")
+    cleanup_patterns(tmpdir, "state_t49_b.json")
+
+    print("\n  [Machine A] 导入、升级、撤销、再应用...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli(["confirm", "overview"], sp_a)
+
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+    run_cli_with_rules(
+        ["rules_upgrade_apply",
+         "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor",
+         "--operator", "user_A49"],
+        sp_a, stricter_rules
+    )
+
+    run_cli_with_rules(
+        ["rules_upgrade_undo", "--reason", "test revoke", "--operator", "user_A49"],
+        sp_a, stricter_rules
+    )
+
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+    run_cli_with_rules(
+        ["rules_upgrade_apply",
+         "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor",
+         "--operator", "user_A49"],
+        sp_a, stricter_rules
+    )
+
+    s_a_before_export = read_state(sp_a)
+    rules_ver_a = s_a_before_export["rules_version"]
+    hist_count_a = len(s_a_before_export.get("rules_upgrade_history", []))
+    revoked_count_a = len([r for r in s_a_before_export["rules_upgrade_history"] if r.get("revoked")])
+    active_count_a = len([r for r in s_a_before_export["rules_upgrade_history"] if not r.get("revoked")])
+
+    safe_print(f"  导出前: rules_version={rules_ver_a[:16]}..., "
+               f"history={hist_count_a}, active={active_count_a}, revoked={revoked_count_a}")
+    assert hist_count_a == 2, "t49: 导出前应有 2 条升级历史（1 撤销 + 1 活跃）"
+    assert revoked_count_a == 1, "t49: 导出前应有 1 条已撤销"
+    assert active_count_a == 1, "t49: 导出前应有 1 条活跃"
+
+    print("\n  [Machine A] 导出交接包...")
+    pkg = os.path.join(tmpdir, "handover_t49.zip")
+    run_cli_with_rules(
+        ["export_package", "-o", pkg, "--operator", "user_A49"],
+        sp_a, stricter_rules
+    )
+
+    print("\n  [Machine B] 导入交接包...")
+    res_import = run_cli_with_rules(
+        ["import_package", pkg, "--operator", "user_B49"],
+        sp_b, stricter_rules
+    )
+    assert_in("Package rules snapshot IDENTICAL to local rules", res_import.stdout,
+              "t49: 导入时应检测包内规则与本地一致")
+
+    print("\n  [Machine B] 确认接管...")
+    run_cli_with_rules(["takeover_confirm", "--operator", "user_B49"], sp_b, stricter_rules)
+
+    s_b_after = read_state(sp_b)
+    rules_ver_b = s_b_after["rules_version"]
+    hist_count_b = len(s_b_after.get("rules_upgrade_history", []))
+    revoked_count_b = len([r for r in s_b_after["rules_upgrade_history"] if r.get("revoked")])
+    active_count_b = len([r for r in s_b_after["rules_upgrade_history"] if not r.get("revoked")])
+
+    safe_print(f"  导入后: rules_version={rules_ver_b[:16]}..., "
+               f"history={hist_count_b}, active={active_count_b}, revoked={revoked_count_b}")
+
+    assert_eq(rules_ver_b, rules_ver_a, "t49: 导入后 rules_version 应与导出时相同")
+    assert_eq(hist_count_b, hist_count_a, "t49: 导入后升级历史数量应相同")
+    assert_eq(revoked_count_b, revoked_count_a, "t49: 导入后已撤销数量应相同")
+    assert_eq(active_count_b, active_count_a, "t49: 导入后活跃数量应相同")
+
+    chg003_b = next(i for i in s_b_after["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_b["risk_level"], "high", "t49: 导入后 CHG-003 risk_level=high（升级结果保留）")
+    assert_eq(chg003_b["category"], "refactor", "t49: 导入后 CHG-003 category=refactor（升级结果保留）")
+
+    print("\n  [Machine B] 查看规则历史（应显示全部历史）...")
+    res_hist = run_cli_with_rules(["rules_history"], sp_b, stricter_rules)
+    assert_in("user_A49", res_hist.stdout, "t49: 历史应显示原操作人 user_A49")
+    assert_in("Total upgrades: 2", res_hist.stdout, "t49: 历史应显示总共 2 条升级")
+
+    print("\n  [Machine B] 继续审批工作（确认剩余章节）...")
+    run_cli_with_rules(["confirm", "migration"], sp_b, stricter_rules)
+    run_cli_with_rules(["confirm", "known_issues"], sp_b, stricter_rules)
+
+    s_b_final = read_state(sp_b)
+    assert_eq(s_b_final["confirmations"]["migration"], True, "t49: B 方可继续确认 migration")
+    assert_eq(s_b_final["confirmations"]["known_issues"], True, "t49: B 方可继续确认 known_issues")
+
+    print("\n  [OK] 规则升级信息在交接包中完整保留，接手方可继续工作")
+    cleanup_patterns(tmpdir, "state_t49_a.json")
+    cleanup_patterns(tmpdir, "state_t49_b.json")
+
+
+def test_50_full_e2e_rules_upgrade_workflow(tmpdir):
+    """完整端到端：规则变更→预检→应用→重启恢复→导包接手→继续审批"""
+    print("\n== Test 50: Full E2E rules upgrade workflow ==")
+    sp_a = os.path.join(tmpdir, "state_t50_a.json")
+    sp_b = os.path.join(tmpdir, "state_t50_b.json")
+    stricter_rules = os.path.join(tmpdir, "rules_stricter.yaml")
+    _make_rules_stricter(stricter_rules)
+    cleanup_patterns(tmpdir, "state_t50_a.json")
+    cleanup_patterns(tmpdir, "state_t50_b.json")
+
+    print("\n  [Phase 1 - Machine A] 初始导入与部分工作...")
+    run_cli(["import", SAMPLE], sp_a)
+    run_cli(["confirm", "overview"], sp_a)
+
+    s_phase1 = read_state(sp_a)
+    rules_ver_initial = s_phase1["rules_version"]
+    safe_print(f"  初始规则版本: {rules_ver_initial[:16]}...")
+
+    print("\n  [Phase 2 - Machine A] 规则变更，执行预检...")
+    run_cli_with_rules(["rules_upgrade_check"], sp_a, stricter_rules)
+
+    s_phase2 = read_state(sp_a)
+    pending = s_phase2["pending_rules_upgrade"]
+    upgrade_id = pending["upgrade_id"]
+    manual_count = pending["impact"]["summary"]["manual_decision_count"]
+    safe_print(f"  升级 ID: {upgrade_id}")
+    safe_print(f"  需人工决策: {manual_count} 项")
+    assert manual_count >= 1, "t50: 至少应有 1 项人工决策"
+
+    print("\n  [Phase 3 - Machine A] 模拟进程中断（重启）...")
+    run_cli(["confirm", "changes"], sp_a)
+
+    s_before_restart = read_state(sp_a)
+    s_before_restart["pending_rules_upgrade"]["check_pid"] = 99999
+    with open(sp_a, "w", encoding="utf-8") as f:
+        json.dump(s_before_restart, f, ensure_ascii=False, indent=2)
+
+    print("\n  [Phase 4 - Machine A] 重启后恢复，应用升级...")
+    apply_script = os.path.join(tmpdir, "run_apply_t50.py")
+    with open(apply_script, "w", encoding="utf-8") as f:
+        f.write(f"""
+import sys
+sys.path.insert(0, r"{SCRIPT_DIR}")
+from release_cli import main as cli_main
+sys.argv = ["release_cli.py", "--rules", r"{stricter_rules}", "--state", r"{sp_a}",
+            "rules_upgrade_apply", "--per-item", "CHG-003.risk_level=high,CHG-003.category=refactor",
+            "--operator", "operator_A50"]
+cli_main()
+""")
+    result = subprocess.run(
+        [sys.executable, apply_script],
+        capture_output=True,
+        cwd=SCRIPT_DIR,
+    )
+    apply_output = result.stdout.decode('utf-8', errors='replace') + result.stderr.decode('utf-8', errors='replace')
+
+    s_phase4 = read_state(sp_a)
+    resume_events = [e for e in s_phase4["audit_log"] if e["action"] == "pending_rules_upgrade_resumed"]
+    assert len(resume_events) >= 1, "t50: 重启后应用应触发续做检测"
+    assert_in("Resumed:           Yes (across restart)", apply_output,
+              "t50: apply 输出应显示跨重启续做")
+
+    rules_ver_after_upgrade = s_phase4["rules_version"]
+    assert rules_ver_after_upgrade != rules_ver_initial, "t50: 升级后规则版本应变化"
+
+    chg003_a = next(i for i in s_phase4["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_a["risk_level"], "high", "t50: A 方升级后 CHG-003 risk_level=high")
+
+    print("\n  [Phase 5 - Machine A] 导出交接包...")
+    pkg = os.path.join(tmpdir, "handover_t50.zip")
+    run_cli_with_rules(
+        ["export_package", "-o", pkg, "--operator", "operator_A50",
+         "--description", "v2.1.0 已完成规则升级交接包"],
+        sp_a, stricter_rules
+    )
+
+    print("\n  [Phase 6 - Machine B] 导入交接包并确认接管...")
+    run_cli_with_rules(
+        ["import_package", pkg, "--operator", "operator_B50"],
+        sp_b, stricter_rules
+    )
+    run_cli_with_rules(["takeover_confirm", "--operator", "operator_B50"], sp_b, stricter_rules)
+
+    s_phase6 = read_state(sp_b)
+    assert_eq(s_phase6["rules_version"], rules_ver_after_upgrade,
+              "t50: B 方接管后规则版本与 A 方一致")
+    assert len(s_phase6.get("rules_upgrade_history", [])) == 1, "t50: B 方应有 1 条升级历史"
+    assert not s_phase6["rules_upgrade_history"][0].get("revoked"), "t50: 升级记录为活跃状态"
+
+    chg003_b = next(i for i in s_phase6["items"] if i["id"] == "CHG-003")
+    assert_eq(chg003_b["risk_level"], "high", "t50: B 方 CHG-003 risk_level=high（升级结果保留）")
+    assert_eq(chg003_b["category"], "refactor", "t50: B 方 CHG-003 category=refactor（升级结果保留）")
+
+    print("\n  [Phase 7 - Machine B] 继续审批，补全信息并批准...")
+    run_cli_with_rules(["amend", "CHG-003", "--field", "owner=周七"], sp_b, stricter_rules)
+    run_cli_with_rules(["amend", "CHG-005", "--field", "risk_level=high"], sp_b, stricter_rules)
+    run_cli_with_rules(["confirm", "migration"], sp_b, stricter_rules)
+    run_cli_with_rules(["confirm", "known_issues"], sp_b, stricter_rules)
+    run_cli_with_rules(["draft"], sp_b, stricter_rules)
+    run_cli_with_rules(["approve"], sp_b, stricter_rules)
+
+    s_final = read_state(sp_b)
+    assert_eq(s_final["approved"], True, "t50: B 方最终成功批准")
+
+    md_out = os.path.join(tmpdir, "t50_final.md")
+    run_cli_with_rules(["export", "-o", md_out], sp_b, stricter_rules)
+    md = read_file(md_out)
+    assert_in("# Release Notes v2.1.0", md, "t50: 最终导出的 Markdown 标题正确")
+
+    final_actions = [e["action"] for e in s_final["audit_log"]]
+    expected = ["import", "confirm", "rules_upgrade_checked",
+                "pending_rules_upgrade_resumed", "rules_upgrade_applied",
+                "import_package_merge", "takeover_confirmed",
+                "approved"]
+    for act in expected:
+        assert_in(act, final_actions, f"t50: 审计日志应包含 {act}")
+
+    print("\n  [OK] 完整链路验证通过：规则变更→预检→重启恢复→应用→导包→接手→补全→批准→导出")
+    cleanup_patterns(tmpdir, "state_t50_a.json")
+    cleanup_patterns(tmpdir, "state_t50_b.json")
+
+
 def main():
     global PASS, FAIL
     try:
@@ -3254,6 +3749,12 @@ def main():
         test_42_cross_restart_persisted_session(tmpdir)
         test_43_full_e2e_handoff_confirm_restart_approve(tmpdir)
         test_44_utf8_mode_encoding_stability(tmpdir)
+        test_45_rules_upgrade_check_basic(tmpdir)
+        test_46_rules_upgrade_apply_and_undo(tmpdir)
+        test_47_rules_upgrade_skip_and_status(tmpdir)
+        test_48_rules_upgrade_cross_restart_resume(tmpdir)
+        test_49_rules_upgrade_handover_preservation(tmpdir)
+        test_50_full_e2e_rules_upgrade_workflow(tmpdir)
     except Exception as e:
         fatal_exception = e
         safe_print(f"\n*** FATAL EXCEPTION during tests: {type(e).__name__}: {e} ***")
