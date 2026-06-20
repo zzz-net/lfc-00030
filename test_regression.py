@@ -38,10 +38,8 @@ def run_cli(args, state_path, expect_fail=False):
 def run_cli_utf8(args, state_path, expect_fail=False):
     """调用 CLI 时显式加 -X utf8，模拟 Python UTF-8 模式"""
     cmd = [sys.executable, "-X", "utf8", CLI, "--rules", RULES, "--state", state_path] + args
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8:replace"
     res = subprocess.run(cmd, capture_output=True, text=True,
-                         encoding="utf-8", errors="replace", cwd=SCRIPT_DIR, env=env)
+                         encoding="utf-8", errors="replace", cwd=SCRIPT_DIR)
     ok = res.returncode != 0 if expect_fail else res.returncode == 0
     if not ok:
         safe_print(f"  [FAIL -X utf8] {' '.join(args)}")
@@ -2147,14 +2145,11 @@ from release_cli import main as cli_main
 sys.argv = ["release_cli.py", "--state", r"{sp_b}", "audit_view"]
 cli_main()
 """)
-    env_spb = os.environ.copy()
-    env_spb["PYTHONIOENCODING"] = "utf-8:replace"
     result = subprocess.run(
         [sys.executable, audit_script],
         capture_output=True,
-        env=env_spb
     )
-    audit_output = result.stdout.decode('utf-8', errors='ignore') + result.stderr.decode('utf-8', errors='ignore')
+    audit_output = result.stdout.decode('utf-8', errors='replace') + result.stderr.decode('utf-8', errors='replace')
 
     print(f"\n  [验证] 重启后 audit_view 输出...")
     assert_in("Cross-restart:  YES", audit_output,
@@ -2290,14 +2285,11 @@ from release_cli import main as cli_main
 sys.argv = ["release_cli.py", "--state", r"{sp_b}", "audit_view"]
 cli_main()
 """)
-    env_spb = os.environ.copy()
-    env_spb["PYTHONIOENCODING"] = "utf-8:replace"
     result = subprocess.run(
         [sys.executable, audit_script],
         capture_output=True,
-        env=env_spb
     )
-    audit_output = result.stdout.decode('utf-8', errors='ignore') + result.stderr.decode('utf-8', errors='ignore')
+    audit_output = result.stdout.decode('utf-8', errors='replace') + result.stderr.decode('utf-8', errors='replace')
 
     print(f"\n  [验证] 重启后 audit_view 输出...")
     assert_in("Cross-restart:  YES", audit_output, "t35: after restart, shows Cross-restart YES")
@@ -2944,10 +2936,8 @@ from release_cli import main as cli_main
 sys.argv = ["release_cli.py", "--rules", r"{RULES}", "--state", r"{sp_m2}", "audit_view"]
 cli_main()
 """)
-    env43 = os.environ.copy()
-    env43["PYTHONIOENCODING"] = "utf-8:replace"
     res_subp = subprocess.run([sys.executable, audit_script], capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", env=env43)
+                              text=True, encoding="utf-8", errors="replace")
     subp_out = res_subp.stdout + res_subp.stderr
 
     assert_in("Cross-restart:  YES", subp_out, "t43 restarted audit_view shows Cross-restart YES")
